@@ -30,12 +30,11 @@ pub enum NativeAbiProfile {
 pub fn lookup_profile(profile: NativeAbiProfile, group:u8, id:u16)->Option<NativeCallAbi> {
     if profile==NativeAbiProfile::Amachoco {
         let (argc,stack_outputs)=match (group,id) {
+            (0x81,0x00)=>(1,1),
             (0x81,0x21)=>(2,0),
             (0x81,0xD8)=>(2,1),
             (0x81,0xDA)=>(3,1),
-            // BGI 1.678: text codepage switch (0 CP932, 1 UTF-8) and the
-            // font family list (buffer, charset).
-            (0x81,0x00)=>(1,1),
+            // BGI 1.678 font family list (buffer, charset).
             (0xB0,0xC5)=>(2,1),
             // Window flag, windowed size query, render size request and
             // a graph flag.
@@ -43,6 +42,7 @@ pub fn lookup_profile(profile: NativeAbiProfile, group:u8, id:u16)->Option<Nativ
             (0x81,0x67)=>(1,0),
             (0x81,0x6C)=>(2,1),
             (0x91,0x09)=>(1,1),
+            (0x92,0x99)=>(7,1),
             _=>return lookup(group,id),
         };
         return Some(NativeCallAbi {argc,stack_outputs,installs_procedure:false,raw_descriptor_bit8:stack_outputs!=0});

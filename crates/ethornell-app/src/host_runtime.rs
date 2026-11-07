@@ -986,8 +986,13 @@ impl RuntimeEngine {
         encoding: &'static encoding_rs::Encoding,
     ) -> Self {
         let program = ethornell_script::parse_bp_program(Some(script.into()), bytes);
-        let mut vm = ethornell_vm::Vm::new();
-        vm.set_native_abi_profile(confirmed_native_profile(&manager, bytes));
+        let profile = confirmed_native_profile(&manager, bytes);
+        let mut vm = ethornell_vm::Vm::with_main_thread_regions(
+            profile.main_code_bytes,
+            profile.main_data_bytes,
+            4096,
+        );
+        vm.set_native_abi_profile(profile.abi);
         vm.set_graph_text_encoding(encoding);
         vm.start(&program);
         Self {
@@ -995,6 +1000,7 @@ impl RuntimeEngine {
             api: {
                 let mut api = RuntimeTraceApi::new_with_native_root(manager, root);
                 api.configure_for_dialect(program.dialect);
+                api.configure_native_sound_channels(profile.se_channels);
                 api
             },
             options: ethornell_vm::VmRunOptions {
@@ -1111,6 +1117,102 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    #[ignore = "requires ETHORNELL_RESTRICTED_REPRO_GAME; private temporary user root"]
+    #[cfg(unix)]
+    fn authorized_sample_restricted_startup() {
+        ethornell_core::init_tracing();
+        let resource =
+            PathBuf::from(std::env::var_os("ETHORNELL_RESTRICTED_REPRO_GAME").expect("game copy"));
+        let user = std::env::temp_dir().join(format!(
+            "ethornell-restricted-startup-{}",
+            std::process::id(),
+        ));
+        std::fs::create_dir(&user).unwrap();
+        let outcome = (|| -> Result<()> {
+            let mut host = HostRuntime::create(HostConfig {
+                resource_root: resource,
+                user_root: user.clone(),
+                font_path: None,
+                font_data: None,
+                font_face_index: 0,
+                fallback_font: None,
+                gbk: false,
+                backend: 0,
+                strict: false,
+                trace: false,
+                silent: true,
+                launcher: None,
+            })?;
+            host.runtime.options.collect_diagnostics = true;
+            host.scope(|host| -> Result<()> {
+                let mut input = HeadlessInputScript::from_env();
+                let frames = parse_usize_env("ETHORNELL_RESTRICTED_REPRO_FRAMES")
+                    .unwrap_or(2000)
+                    .min(5000);
+                for frame in 0..frames {
+                    let report = runtime_frontend::drive_runtime_frame_checked(
+                        &mut host.runtime,
+                        &mut host.input_queue,
+                        &mut input,
+                        RuntimeFramePacing,
+                        16,
+                        16,
+                        None,
+                        "restricted-repro",
+                        false,
+                    )?;
+                    host.runtime
+                        .vm
+                        .check_resource_budget(host.vm_budget)
+                        .map_err(|error| EthornellError::Other(error.to_string()))?;
+                    if let Some(message) = host.runtime.api.host.fatal.take() {
+                        return Err(EthornellError::Other(format!(
+                            "restricted startup frame={frame}: {message}; {}",
+                            host.diagnostics(),
+                        )));
+                    }
+                    if let Some(report) = report
+                        .last_report
+                        .as_ref()
+                        .filter(|report| report.stop_reason.is_fatal())
+                    {
+                        return Err(EthornellError::Other(format!(
+                            "restricted startup frame={frame}: {report:?}",
+                        )));
+                    }
+                    if let Some(event) = host
+                        .runtime
+                        .api
+                        .host
+                        .events
+                        .iter()
+                        .find(|event| event.kind == 2)
+                    {
+                        return Err(EthornellError::Other(format!(
+                            "restricted startup prompt frame={frame}: {}",
+                            event.text,
+                        )));
+                    }
+                    if frame % 300 == 0 {
+                        eprintln!("restricted startup frame={frame}: {}", host.diagnostics());
+                    }
+                }
+                if let Some(path) = std::env::var_os("ETHORNELL_RESTRICTED_REPRO_SNAPSHOT") {
+                    snapshot::write_runtime_snapshot(&host.runtime.api, Path::new(&path))?;
+                }
+                eprintln!(
+                    "restricted startup complete: {}; user_files={:?}",
+                    host.diagnostics(),
+                    host.policy.enumerate("*", true, 0, false)?
+                );
+                Ok(())
+            })
+        })();
+        std::fs::remove_dir_all(user).unwrap();
+        outcome.unwrap();
+    }
+
     #[test]
     #[ignore = "requires an authorized read-only sample via ETHORNELL_RESTRICTED_REPRO_GAME; private temporary user root"]
     #[cfg(unix)]
