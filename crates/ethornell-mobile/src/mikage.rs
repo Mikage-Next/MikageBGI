@@ -1,4 +1,4 @@
-//! Calls added for the Mikage player (itsCheney/Mikage-Next), next to the
+//! Calls added for the Mikage player (Mikage-Next/Mikage-Next), next to the
 //! host ABI. They don't change any ABI v1 behaviour.
 //!
 //! `ethornell_mikage_set_fallback_font` puts a second font behind the

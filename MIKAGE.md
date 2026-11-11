@@ -1,7 +1,7 @@
 # The Mikage branch
 
-`mikage` is the branch of [itsCheney/ethornell-rs](https://github.com/itsCheney/ethornell-rs)
-that [Mikage](https://github.com/itsCheney/Mikage-Next) builds its BGI engine
+`mikage` is the branch of [Mikage-Next/MikageBGI](https://github.com/Mikage-Next/MikageBGI)
+that [Mikage](https://github.com/Mikage-Next/Mikage-Next) builds its BGI engine
 from (`Engine/EthornellRuntime/Source`). It follows upstream
 [xmoezzz/ethornell-rs](https://github.com/xmoezzz/ethornell-rs) `main` and adds
 a few small commits:
