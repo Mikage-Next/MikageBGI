@@ -1,7 +1,10 @@
 use ethornell_archive::{MagicKind, ResourceManager, detect_magic, scan_game_root};
 use ethornell_audio::AudioSystem;
 use ethornell_core::{EthornellError, GameRoot, Result};
-use ethornell_image::{DecodedImage, decode_image, parse_cbg_metadata};
+use ethornell_image::{
+    DecodedImage, decode_image, parse_cbg_metadata, raw_bgi_embedded_point,
+    raw_bgi_native_bitmap_format,
+};
 use ethornell_render::{RenderCommand, Renderer, TextStyleSpan, TextureHandle};
 use ethornell_script::calls::known_call_arg_count;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -1029,7 +1032,9 @@ struct RuntimeTraceApi {
     /// Target dword_565FD0 is a prepend-only linked watch list. Duplicate
     /// registrations are permitted and 90:DF removes the first matching node.
     graph_knob_watches: VecDeque<i32>,
-    graph_knob_input_mode: i32,
+    /// Graph90:DD swaps the WM_MOUSEWHEEL-to-Knob gate only. Native startup
+    /// sub_496390 sets it to 1; left/right pointer capture is independent.
+    graph_knob_wheel_mode: i32,
     /// Target CDspObjGroup registry: 8 slots, handles 0xF1000000 | slot.
     graph_groups: BTreeMap<i32, GraphGroupState>,
     graph_native_owners: BTreeMap<i32, i32>,
@@ -1510,7 +1515,7 @@ impl RuntimeTraceApi {
             display_changes: 0,
             graph_knob_states: BTreeMap::new(),
             graph_knob_watches: VecDeque::new(),
-            graph_knob_input_mode: 0,
+            graph_knob_wheel_mode: 1,
             graph_groups: BTreeMap::new(),
             graph_native_owners: BTreeMap::new(),
             surface_controls: SurfaceControlRegistry::default(),
@@ -2510,7 +2515,7 @@ impl RuntimeTraceApi {
                 return -1;
             };
             let explicit = name.replace('\\', "/").starts_with("bgi-");
-            let metadata = policy.metadata(&name).or_else(|| {
+            let metadata = policy.user_metadata(&name).or_else(|| {
                 if explicit {
                     None
                 } else {
@@ -2734,8 +2739,10 @@ impl RuntimeTraceApi {
                     return false;
                 };
                 (native_format, None, None)
+            } else if let Some(native_format) = raw_bgi_native_bitmap_format(&bytes) {
+                (native_format, raw_bgi_embedded_point(&bytes), None)
             } else {
-                // Portable PNG/JPEG/raw-image compatibility resources have no
+                // Portable PNG/JPEG compatibility resources have no
                 // target CBG subtype to recover. Keep the historical RGBA
                 // format-2 interpretation for those non-CBG paths.
                 (2, None, None)
@@ -4613,10 +4620,12 @@ impl RuntimeTraceApi {
                 if point.0 < x || point.1 < y || point.0 >= x + width || point.1 >= y + height {
                     return None;
                 }
-                Some((
-                    self.graph90_native_sort_key(handle).unwrap_or_default(),
-                    handle,
-                ))
+                // SenmomoFD sub_46CBC0 queries vtable+0x1c, then
+                // sub_477650 checks the full pointer-scope chain. A higher
+                // icon/modal input scope must prevent a Knob from capturing.
+                let scope = self.graph90_native_sort_key(handle).unwrap_or_default();
+                native_pointer_scope_eligible_at(self, scope as i32, Some(point))
+                    .then_some((scope, handle))
             })
             .max()
             .map(|(_, handle)| handle)
@@ -4745,6 +4754,9 @@ impl RuntimeTraceApi {
     /// list is independent of hover/capture: its first node consumes the wheel
     /// and changes the watched Knob's logical Y coordinate by exactly one.
     fn process_graph_knob_mouse_wheel(&mut self, delta_y: f32) -> bool {
+        if self.graph_knob_wheel_mode == 0 {
+            return false;
+        }
         let Some(&handle) = self.graph_knob_watches.front() else {
             return false;
         };
@@ -7701,13 +7713,25 @@ impl RuntimeTraceApi {
             }
         }
         self.store_graph_image(composite_key.clone(), destination_image);
-        self.graph_resources.insert(
-            destination,
-            RuntimeGraphResource::whole(composite_key.clone()),
-        );
+        // sub_40A9E0 writes the existing bitmap's pixels; it does not allocate
+        // another descriptor. Keep the binding generation, just as 90:15
+        // does, so eye/mouth blits do not invalidate live projected sprites.
+        // SugarStyle's 484020 -> 402980 likewise resolves the existing
+        // descriptors via 4085F0 before 40AC60, without allocating a slot.
+        // Keep the writable copy separate from shared decoded archive images.
+        if let Some(binding) = self.graph_resources.get_mut(&destination) {
+            binding.key = composite_key.clone();
+            binding.source_rect = None;
+        } else {
+            self.graph_resources.insert(
+                destination,
+                RuntimeGraphResource::whole(composite_key.clone()),
+            );
+        }
         if let Some(surface) = self.graph_surfaces.get_mut(&destination) {
             surface.resource_id = Some(destination);
         }
+        self.refresh_bitmap_nodes(destination);
         Some(composite_key)
     }
 
@@ -15234,6 +15258,30 @@ mod input_tests {
             Value::Int(0)
         );
 
+        // 90:DD disables only Knob wheel routing. The physical wheel still
+        // reaches the ordinary input records, and the old gate is returned.
+        let mut disable_wheel = vec![Value::Int(0)];
+        assert_eq!(
+            call_graph(&mut api, 0x90, 0xdd, &mut disable_wheel).unwrap(),
+            Value::Int(1)
+        );
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MouseWheel { delta_y: 1.0 },
+        );
+        assert_eq!(api.graph_knob_states[&knob].y, 4);
+        assert_eq!(
+            api.pending_input_descriptor,
+            Some(super::INPUT_DESCRIPTOR_MOUSE_WHEEL_UP)
+        );
+        assert!(!api.pending_input_consumed);
+        let mut enable_wheel = vec![Value::Int(7)];
+        assert_eq!(
+            call_graph(&mut api, 0x90, 0xdd, &mut enable_wheel).unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(api.graph_knob_wheel_mode, 7);
+
         let mut zero = vec![Value::Int(knob), Value::Int(0), Value::Int(0)];
         call_graph(&mut api, 0x90, 0xd6, &mut zero).unwrap();
         super::apply_runtime_input_event(
@@ -15407,6 +15455,7 @@ mod input_tests {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
         let mut api = super::RuntimeTraceApi::new(manager);
+        api.input_configuration_enabled = 1;
         let target = 604;
         api.graph_layers.insert(
             target,
@@ -15433,6 +15482,7 @@ mod input_tests {
                 clip: None,
             },
         );
+        api.graph_object_layers.insert(target, [target].into_iter().collect());
         let mut create = vec![Value::Int(target)];
         let handle = match call_graph(&mut api, 0x90, 0xd0, &mut create).unwrap() {
             Value::Int(handle) => handle,
@@ -15446,6 +15496,19 @@ mod input_tests {
         call_graph(&mut api, 0x90, 0xd6, &mut initial).unwrap();
         let mut enable = vec![Value::Int(handle), Value::Int(1)];
         call_graph(&mut api, 0x90, 0xd4, &mut enable).unwrap();
+
+        // Like sub_46CBC0 -> sub_477650, a higher input scope blocks the
+        // wrapper even when its rectangle contains the pointer.
+        let scope = api.graph90_native_sort_key(handle).unwrap_or_default();
+        api.registered_pointer_input_scopes.register((scope + 1) as i32);
+        assert_eq!(api.graph_knob_at_point((110.0, 210.0)), None);
+        api.registered_pointer_input_scopes.unregister_one((scope + 1) as i32);
+        let mut disable_wheel = vec![Value::Int(0)];
+        assert_eq!(
+            call_graph(&mut api, 0x90, 0xdd, &mut disable_wheel).unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(api.graph_knob_at_point((110.0, 210.0)), Some(handle));
 
         super::apply_runtime_input_event(
             &mut api,
@@ -22404,14 +22467,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
 
     fn read_disk_file(&mut self, path: &str) -> Option<Vec<u8>> {
         if let Some(policy) = file_policy::active() {
-            // Saves written through the UserData / root save-file aliases
-            // live in the user root; Wonderful Everyday HD reads them back
-            // with Sys80:31 like any loose file, and its existence checks
-            // already see the user copy.
-            if file_policy::is_user_alias(path) {
-                return policy.read_user(path).ok();
-            }
-            return policy.read_loose(path).ok();
+            return policy.read_loose(&file_policy::user_data_alias(path)).ok();
         }
         let host = find_runtime_file_from_root(&self.manager, &self.native_root, "", path)?;
         host.is_file().then(|| std::fs::read(&host).ok()).flatten()
@@ -22419,14 +22475,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
 
     fn disk_file_exists(&mut self, path: &str) -> bool {
         if let Some(policy) = file_policy::active() {
-            // Sys80:34 is how Wonderful Everyday HD finds its saves before
-            // reading them back, so it must see the aliased user copy.
-            let meta = if file_policy::is_user_alias(path) {
-                policy.user_metadata(path)
-            } else {
-                policy.metadata(path)
-            };
-            return meta.is_some_and(|meta| !meta.is_dir());
+            return policy.user_metadata(path).is_some_and(|meta| !meta.is_dir());
         }
         find_runtime_file_from_root(&self.manager, &self.native_root, "", path)
             .is_some_and(|host| host.is_file())
@@ -22437,13 +22486,20 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             return None;
         }
         if file_policy::active().is_some() {
-            return read_runtime_bytes(&self.manager, archive, entry);
+            // The VM owns DSC/SDC decoding and native archive status codes.
+            // Return packed bytes from an indexed descriptor, including for
+            // composite members named Archive\\data01000.arc.
+            let found = user_files::indexed_archive_entry(&self.manager, archive, entry)?;
+            return self.manager.read_by_entry_raw(&found).ok();
         }
         let found = find_runtime_resource(&self.manager, archive, entry)?;
         self.manager.read_by_entry_raw(&found).ok()
     }
 
     fn archive_entry_exists(&mut self, archive: &str, entry: &str) -> bool {
+        if file_policy::restricted() {
+            return user_files::indexed_archive_entry(&self.manager, archive, entry).is_some();
+        }
         !is_empty_archive_arg(archive)
             && find_runtime_resource(&self.manager, archive, entry).is_some()
     }
@@ -27708,8 +27764,10 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
             }
             (0x90, 0xdd) => {
                 let value = pop_int_value(stack).unwrap_or_default();
-                let previous = std::mem::replace(&mut self.graph_knob_input_mode, value);
-                tracing::info!(value, previous, "GraphSwapKnobInputMode");
+                // SenmomoFD 48A050 -> 46CC70/46CC60: preserve and return
+                // the previous integer; only WM_MOUSEWHEEL tests this gate.
+                let previous = std::mem::replace(&mut self.graph_knob_wheel_mode, value);
+                tracing::info!(value, previous, "GraphSwapKnobWheelMode");
                 return Ok(ethornell_vm::Value::Int(previous));
             }
             (0x90, 0xde) => {
