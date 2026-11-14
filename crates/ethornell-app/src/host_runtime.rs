@@ -280,6 +280,23 @@ impl HostRuntime {
                 "launcher overlay"
             );
         }
+        // A BGIPatch fan-translation package, when the game ships one beside
+        // its archives, overrides scenario and image resources with translated
+        // copies that live in no archive (see `ethornell-archive::PatchPackage`).
+        #[cfg(fd_policy)]
+        if let Ok(mut file) = policy.open_resource("patch.pak") {
+            let mut bytes = Vec::new();
+            if std::io::Read::read_to_end(&mut file, &mut bytes).is_ok() {
+                match manager.set_patch_package(bytes) {
+                    Ok(true) => tracing::info!(
+                        resources = manager.patch_package().map_or(0, |p| p.len()),
+                        "BGIPatch package"
+                    ),
+                    Ok(false) => {}
+                    Err(err) => tracing::warn!(%err, "BGIPatch package rejected"),
+                }
+            }
+        }
         // Upstream's language view. Our launcher overlay and `.chs` override
         // archives can carry the bootstrap where upstream does not look, so a
         // missing language bootstrap keeps the whole manager.

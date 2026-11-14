@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 pub mod evb;
 pub use evb::EvbOverlay;
+pub mod patch_package;
+pub use patch_package::PatchPackage;
 mod localized;
 pub use localized::ArchiveLanguage;
 
@@ -232,6 +234,9 @@ struct ResourceManagerInner {
     /// Search state the scripts configure at run time (Sys80:36/37/38).
     search: RwLock<RuntimeSearch>,
     overlay: Option<Overlay>,
+    /// A BGIPatch fan-translation package whose resources win over the
+    /// archives, mirroring what the patch's hook DLL does at load time.
+    patch_package: Option<PatchPackage>,
 }
 
 #[derive(Debug, Default)]
@@ -317,6 +322,7 @@ impl ResourceManager {
                 archive_files,
                 search: RwLock::default(),
                 overlay: None,
+                patch_package: None,
             }),
         })
     }
@@ -358,6 +364,30 @@ impl ResourceManager {
     /// The launcher executable's packed files, if one is set.
     pub fn launcher_overlay(&self) -> Option<&EvbOverlay> {
         self.inner.overlay.as_ref().map(|overlay| &overlay.files)
+    }
+
+    /// Installs a BGIPatch fan-translation package whose resources win over the
+    /// game archives. Returns `false` (changing nothing) when the bytes are not
+    /// a PAKZ container. Only before the manager is shared.
+    pub fn set_patch_package(&mut self, bytes: Vec<u8>) -> Result<bool> {
+        let max = usize::try_from(self.inner.limits.max_decoded_bytes).unwrap_or(usize::MAX);
+        let Some(package) = PatchPackage::parse(bytes, max)? else {
+            return Ok(false);
+        };
+        let inner = Arc::get_mut(&mut self.inner)
+            .ok_or_else(|| EthornellError::Other("resource manager already shared".into()))?;
+        inner.patch_package = Some(package);
+        Ok(true)
+    }
+
+    /// The installed BGIPatch package, if any.
+    pub fn patch_package(&self) -> Option<&PatchPackage> {
+        self.inner.patch_package.as_ref()
+    }
+
+    /// The patched, decoded bytes for a resource the BGIPatch package overrides.
+    fn patch_decoded(&self, name: &str) -> Option<Result<Vec<u8>>> {
+        self.inner.patch_package.as_ref()?.read_decoded(name)
     }
 
     fn overlay_entry(&self, name: &str) -> Option<ResourceEntry> {
@@ -535,6 +565,9 @@ impl ResourceManager {
         archive_name: &str,
         entry_name: &str,
     ) -> Result<Vec<u8>> {
+        if let Some(bytes) = self.patch_decoded(entry_name) {
+            return bytes;
+        }
         if let Some(entry) = self.overlay_entry(entry_name) {
             return self.read_by_entry_decoded(&entry);
         }
@@ -559,6 +592,9 @@ impl ResourceManager {
     }
 
     pub fn read_decoded(&self, name: &str) -> Result<Vec<u8>> {
+        if let Some(bytes) = self.patch_decoded(name) {
+            return bytes;
+        }
         if let Some(entry) = self.overlay_entry(name) {
             return self.read_by_entry_decoded(&entry);
         }
@@ -1538,7 +1574,7 @@ fn clean_component(component: &str) -> String {
         .collect()
 }
 
-fn normalize_resource_name(name: &str) -> String {
+pub(crate) fn normalize_resource_name(name: &str) -> String {
     name.replace('\\', "/").to_ascii_lowercase()
 }
 
@@ -2278,6 +2314,7 @@ mod tests {
                 archive_files: Vec::new(),
                 search: RwLock::default(),
                 overlay: None,
+                patch_package: None,
             }),
         };
 
@@ -2325,6 +2362,7 @@ mod tests {
                 archive_files: Vec::new(),
                 search: RwLock::default(),
                 overlay: None,
+                patch_package: None,
             }),
         }
     }

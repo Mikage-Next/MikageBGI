@@ -12,3 +12,4 @@ ethornell-core = { path = "../ethornell-core" }
 serde.workspace = true
 byteorder.workspace = true
 encoding_rs.workspace = true
+ruzstd = "0.7.3"
