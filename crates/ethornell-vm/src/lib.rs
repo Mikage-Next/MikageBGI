@@ -7877,6 +7877,18 @@ impl Vm {
                     .wrapping_add(addend);
                 self.write_int(dst, sized(operand(1)), value as u32)?;
             }
+            0xe8 => {
+                // store_frame_select: pop b, a and a condition, then store the
+                // chosen value into the immediate frame slot. Scripts compile a
+                // min/max clamp as `load_frame N; cmp<= LIMIT; load_frame N;
+                // push LIMIT; e8 N`, i.e. frame[N] = cond ? frame[N] : LIMIT.
+                let (offset, width) = slot(0);
+                let b = self.pop_value()?;
+                let a = self.pop_value()?;
+                let condition = self.pop_numeric()?;
+                let chosen = if condition != 0 { a } else { b };
+                self.write_value(self.frame_ptr(offset), width, &chosen)?;
+            }
             0x45 | 0x46 | 0x47 | 0x7f => {
                 return Err(VmError::Runtime(format!(
                     "BGI 1.678 opcode 0x{:02X} at 0x{:08X} in {} is not implemented",
@@ -17665,6 +17677,36 @@ mod tests {
         assert!(!report.stop_reason.is_fatal(), "{report:?}");
         // sub_4738A0 does not clear the new frame.
         assert_eq!(vm.read_int(vm.frame_ptr(4), 2).unwrap(), 5);
+    }
+
+    #[test]
+    fn v1678_store_frame_select_picks_the_conditional_value() {
+        // The resolution clamp idiom 顔のない月's ipl._bp compiles:
+        // load_frame N; cmp<= LIMIT; load_frame N; push LIMIT; e8 N.
+        // A non-zero condition keeps the frame value, otherwise the limit.
+        let clamp = |value: i32| -> i32 {
+            let v = (value as u16).to_le_bytes();
+            let code = [
+                0x12, 0x20, // frame_alloc 32
+                0x01, v[0], v[1], // push value
+                0x0f, 0x04, 0x80, // store_frame [4] = value (width 2)
+                0x19, 0x04, 0x80, // load_frame [4]
+                0x36, 0x03, 0x32, // cmp <= 50
+                0x19, 0x04, 0x80, // load_frame [4]
+                0x01, 0x32, 0x00, // push 50
+                0xe8, 0x04, 0x80, // store_frame_select [4] = cond ? value : 50
+                0x17, // ret
+            ];
+            let program = ethornell_script::parse_bp_program(None, &code);
+            assert_eq!(program.dialect, ethornell_script::BpDialect::V1678);
+            let mut api = SchedulingApi::default();
+            let mut vm = Vm::new();
+            let report = vm.run(&program, &mut api, &VmRunOptions::default());
+            assert!(!report.stop_reason.is_fatal(), "{report:?}");
+            vm.read_int(vm.frame_ptr(4), 2).unwrap() as i32
+        };
+        assert_eq!(clamp(100), 50); // over the limit: clamped to 50
+        assert_eq!(clamp(30), 30); // within the limit: kept
     }
 
     #[test]

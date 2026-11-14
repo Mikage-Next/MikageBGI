@@ -990,7 +990,7 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
                     operands.push(BpOperand::U8(value));
                 }
             }
-            0x01 | 0x0f | 0x19..=0x1e => {
+            0x01 | 0x0f | 0x19..=0x1e | 0xe8 => {
                 if let Some(value) = read_u16_operand(&mut cursor, &mut raw_len, &mut warning) {
                     operands.push(BpOperand::U16(value));
                 }

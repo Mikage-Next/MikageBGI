@@ -186,6 +186,15 @@ pub const BP_OPCODE_SPECS: &[BpOpcodeSpec] = &[
         evidence: "Dokai dispatch 0x1400C97A0; original handler assembly and fetch helpers",
     },
     BpOpcodeSpec {
+        code: 0xe8,
+        symbol: "store_frame_select",
+        stack_effect: "3 -> 0",
+        immediate: "packed u16 frame load (offset in bits 0..13, width in bits 14..15)",
+        description: "Pop b, a and a condition; store a when the condition is non-zero, otherwise b, into the immediate frame slot.",
+        confidence: "medium",
+        evidence: "顔のない月 ipl._bp resolution clamp: load_frame N; cmp<= LIMIT; load_frame N; push LIMIT; e8 N computes min(frame[N], LIMIT); re-aligns the decode at the following instruction.",
+    },
+    BpOpcodeSpec {
         code: 0xec,
         symbol: "copy_immediate",
         stack_effect: "2 -> 0",
