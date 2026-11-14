@@ -10,6 +10,9 @@ const MAX_RAIN_EFFECTS: usize = 8;
 #[derive(Debug)]
 pub(crate) struct RuntimeEffects {
     pub(crate) vector_revision: u64,
+    /// FD 408D10 / 415610 / 4160D0: clip vector addresses in X/Y,
+    /// rather than treating a row overflow as a valid flat-buffer address.
+    pub(crate) clip_vectors_xy: bool,
     rain: BTreeMap<i32, RainEffect>,
     rain_step_ms: i32,
     rain_native_step: i32,
@@ -24,6 +27,7 @@ impl Default for RuntimeEffects {
     fn default() -> Self {
         Self {
             vector_revision: 0,
+            clip_vectors_xy: false,
             rain: BTreeMap::new(),
             rain_step_ms: 16,
             rain_native_step: 0,
@@ -374,170 +378,70 @@ impl RuntimeEffects {
         self.displacement_maps.get(&bitmap)?.warp(source)
     }
 
-    pub(crate) fn warp_background_displacement(
-        &self,
-        source: &DecodedImage,
-        first: i32,
-        second: Option<i32>,
-        alpha: i32,
-        bilinear: bool,
-    ) -> Option<DecodedImage> {
-        self.warp_displacement_into(
-            source,
-            [source.width, source.height],
-            first,
-            second,
-            alpha,
-            bilinear,
-        )
+    pub(crate) fn warp_background_displacement(&self,source:&DecodedImage,first:i32,second:Option<i32>,alpha:i32,bilinear:bool)->Option<DecodedImage> {
+        self.warp_displacement_into(source,[source.width,source.height],first,second,alpha,bilinear)
     }
-    pub(crate) fn warp_displacement_into(
-        &self,
-        source: &DecodedImage,
-        size: [u32; 2],
-        first: i32,
-        second: Option<i32>,
-        alpha: i32,
-        bilinear: bool,
-    ) -> Option<DecodedImage> {
-        if alpha as u32 > 256 {
-            return None;
-        }
-        let first = self.displacement_maps.get(&first)?;
-        let second = match second {
-            Some(id) => Some(self.displacement_maps.get(&id)?),
-            None => None,
-        };
-        let mut image = DecodedImage {
-            width: size[0],
-            height: size[1],
-            rgba: vec![0; size[0] as usize * size[1] as usize * 4],
-        };
-        for y in 0..image.height {
-            for x in 0..image.width {
-                let index = y as usize * first.width as usize + x as usize;
-                let a = *first.samples.get(index)?;
-                let b = second
-                    .and_then(|m| m.samples.get(y as usize * m.width as usize + x as usize))
-                    .copied();
-                let offset = std::array::from_fn::<_, 2, _>(|c| {
-                    let a = a[c];
-                    if bilinear {
-                        if let Some(b) = b {
-                            if alpha == 256 {
-                                return i32::from(b[c]) >> 1;
-                            }
-                            if alpha == 0 {
-                                return i32::from(a) >> 1;
-                            }
-                            let base = a & !1;
-                            ((i32::from(b[c].wrapping_sub(base)) * (alpha << 7)) >> 16)
-                                + (i32::from(base) >> 1)
-                        } else if alpha == 256 {
-                            i32::from(a) >> 1
-                        } else {
-                            (i32::from(a) * (alpha << 7)) >> 16
-                        }
-                    } else if let Some(b) = b {
-                        let base = a & !3;
-                        let delta = (i32::from(b[c].wrapping_sub(base)) * (alpha << 6)) >> 16;
-                        ((delta + (i32::from(base) >> 2) + 2) as i16 as i32) >> 2
-                    } else {
-                        ((((i32::from(a) * (alpha << 5)) >> 16) + 1) as i16 as i32) >> 1
-                    }
-                });
-                let pixel = if bilinear {
-                    crate::native_background_effect::sample_background_pixel(
-                        source,
-                        x as i32 + (offset[0] >> 3),
-                        y as i32 + (offset[1] >> 3),
-                        offset[0] & 7,
-                        offset[1] & 7,
-                        8,
-                    )
-                } else {
-                    crate::native_background_effect::sample_background_pixel(
-                        source,
-                        x as i32 + offset[0],
-                        y as i32 + offset[1],
-                        0,
-                        0,
-                        8,
-                    )
-                };
-                let target = (y as usize * image.width as usize + x as usize) * 4;
-                image.rgba[target..target + 4].copy_from_slice(&pixel);
-            }
-        }
+    pub(crate) fn warp_displacement_into(&self,source:&DecodedImage,size:[u32;2],first:i32,second:Option<i32>,alpha:i32,bilinear:bool)->Option<DecodedImage> {
+        if alpha as u32>256 {return None;}
+        let first=self.displacement_maps.get(&first)?;
+        let second=match second {Some(id)=>Some(self.displacement_maps.get(&id)?),None=>None};
+        let mut image=DecodedImage{width:size[0],height:size[1],rgba:vec![0;size[0] as usize*size[1] as usize*4]};
+        for y in 0..image.height {for x in 0..image.width {
+            let index=y as usize*first.width as usize+x as usize;
+            let a=*first.samples.get(index)?;
+            let b=second.and_then(|m|m.samples.get(y as usize*m.width as usize+x as usize)).copied();
+            let offset=std::array::from_fn::<_,2,_>(|c| {
+                let a=a[c];
+                if bilinear {
+                    if let Some(b)=b {
+                        if alpha==256 {return i32::from(b[c])>>1;}
+                        if alpha==0 {return i32::from(a)>>1;}
+                        let base=a & !1;
+                        ((i32::from(b[c].wrapping_sub(base)) * (alpha<<7))>>16)+(i32::from(base)>>1)
+                    } else if alpha==256 {i32::from(a)>>1}
+                    else {(i32::from(a)*(alpha<<7))>>16}
+                } else if let Some(b)=b {
+                    let base=a & !3;
+                    let delta=(i32::from(b[c].wrapping_sub(base))*(alpha<<6))>>16;
+                    ((delta+(i32::from(base)>>2)+2) as i16 as i32)>>2
+                } else {((((i32::from(a)*(alpha<<5))>>16)+1) as i16 as i32)>>1}
+            });
+            let pixel=if bilinear {
+                crate::native_background_effect::sample_background_pixel(source,x as i32+(offset[0]>>3),y as i32+(offset[1]>>3),offset[0]&7,offset[1]&7,8)
+            } else {
+                crate::native_background_effect::sample_background_pixel(source,x as i32+offset[0],y as i32+offset[1],0,0,8)
+            };
+            let target=(y as usize*image.width as usize+x as usize)*4;image.rgba[target..target+4].copy_from_slice(&pixel);
+        }}
         Some(image)
     }
 
     /// 409FE0 / 409F30: a record contains four duplicated signed samples.
     /// The native negative-start wrap uses span - remainder, including span
     /// itself when the remainder is zero.
-    pub(crate) fn vm_wave_samples(
-        &self,
-        slot: i32,
-        count: i32,
-        offset: i32,
-        alpha: i32,
-    ) -> Option<Vec<i16>> {
+    pub(crate) fn vm_wave_samples(&self, slot: i32, count: i32, offset: i32, alpha: i32) -> Option<Vec<i16>> {
         let table = self.wave_tables.get(&slot)?;
-        if count <= 0 {
-            return None;
-        }
+        if count <= 0 { return None; }
         let mut start = -4i64 * i64::from(offset);
-        if start < 0 {
-            start = table.block_span as i64 - ((-start) % table.block_span as i64);
-        }
+        if start < 0 { start = table.block_span as i64 - ((-start) % table.block_span as i64); }
         let start = usize::try_from(start).ok()?;
         let end = start.checked_add(count as usize * 4)?;
-        Some(
-            table
-                .samples
-                .get(start..end)?
-                .iter()
-                .map(|s| (i32::from(s[0]).wrapping_mul(alpha) >> 8) as i16)
-                .collect(),
-        )
+        Some(table.samples.get(start..end)?.iter().map(|s| (i32::from(s[0]).wrapping_mul(alpha) >> 8) as i16).collect())
     }
 
     /// Scalar equivalent of the vector-address arithmetic in 414300 and
     /// 414820/414930. Sprite mode 4 wraps the complete source allocation;
     /// BackRPL clips it and optionally interpolates in sixteenth pixels.
-    pub(crate) fn warp_vector_map(
-        &self,
-        bitmap: i32,
-        source: &DecodedImage,
-        waves: &[i16],
-        origin: [i32; 2],
-        size: [u32; 2],
-        wrap: bool,
-        bilinear: bool,
-    ) -> Option<DecodedImage> {
+    pub(crate) fn warp_vector_map(&self, bitmap: i32, source: &DecodedImage, waves: &[i16], origin: [i32;2], size: [u32;2], wrap: bool, bilinear: bool) -> Option<DecodedImage> {
         let map = self.vector_maps.get(&bitmap)?;
-        if source.width == 0 || source.height == 0 {
-            return None;
-        }
+        if source.width == 0 || source.height == 0 { return None; }
         let width = size[0].min(map.width);
         let height = size[1].min(map.height);
-        let mut output = DecodedImage {
-            width,
-            height,
-            rgba: vec![0; width as usize * height as usize * 4],
-        };
+        let mut output = DecodedImage { width, height, rgba: vec![0; width as usize * height as usize * 4] };
         let count = i64::from(source.width) * i64::from(source.height);
-        let pixel = |index: i64| -> [u8; 4] {
-            let index = if wrap {
-                index.rem_euclid(count)
-            } else if !(0..count).contains(&index) {
-                return [0; 4];
-            } else {
-                index
-            };
-            source.rgba[index as usize * 4..index as usize * 4 + 4]
-                .try_into()
-                .unwrap()
+        let pixel = |index: i64| -> [u8;4] {
+            let index = if wrap { index.rem_euclid(count) } else if !(0..count).contains(&index) { return [0;4]; } else { index };
+            source.rgba[index as usize*4..index as usize*4+4].try_into().unwrap()
         };
         for y in 0..height {
             for x in 0..width {
@@ -545,28 +449,37 @@ impl RuntimeEffects {
                 let wave = i32::from(*waves.get(vector.phase as usize).unwrap_or(&0));
                 let px = i32::from(vector.x) * wave;
                 let py = i32::from(vector.y) * wave;
-                let address = i64::from(y as i32 + origin[1] + (py >> 16))
-                    * i64::from(source.width)
-                    + i64::from(x as i32 + origin[0] + (px >> 16));
-                let mut color = pixel(address);
+                let component = |product: i32| -> i32 {
+                    if self.clip_vectors_xy && !wrap && !bilinear {
+                        // mulhi_epi16 + (mullo_epi16 >> 15), then 16-bit add.
+                        ((product >> 16) + ((product as u32 >> 15) & 1) as i32) as i16 as i32
+                    } else { product >> 16 }
+                };
+                let sx = if self.clip_vectors_xy && !wrap { (x as i32 + origin[0] + component(px)) as i16 as i32 }
+                         else { x as i32 + origin[0] + component(px) };
+                let sy = if self.clip_vectors_xy && !wrap { (y as i32 + origin[1] + component(py)) as i16 as i32 }
+                         else { y as i32 + origin[1] + component(py) };
+                let sample = |dx: i32, dy: i32| {
+                    let (sx,sy) = (sx+dx,sy+dy);
+                    if self.clip_vectors_xy && !wrap && (sx<0 || sy<0 || sx>=source.width as i32 || sy>=source.height as i32) { [0;4] }
+                    else { pixel(i64::from(sy)*i64::from(source.width)+i64::from(sx)) }
+                };
+                let mut color = sample(0,0);
                 if bilinear {
                     let fx = (px as u32 >> 12) & 15;
                     let fy = (py as u32 >> 12) & 15;
-                    let right = pixel(address + 1);
-                    let below = pixel(address + i64::from(source.width));
-                    let diagonal = pixel(address + i64::from(source.width) + 1);
+                    let right = sample(1,0);
+                    let below = sample(0,1);
+                    let diagonal = sample(1,1);
                     for c in 0..4 {
-                        let mix = |a: u8, b: u8, t: u32| -> i32 {
-                            i32::from(b) + ((i32::from(a) - i32::from(b)) * (16 - t) as i32 >> 4)
-                        };
-                        let top = mix(color[c], right[c], fx);
-                        let bottom = mix(below[c], diagonal[c], fx);
-                        color[c] =
-                            (bottom + ((top - bottom) * (16 - fy) as i32 >> 4)).clamp(0, 255) as u8;
+                        let mix = |a: u8,b: u8,t:u32| -> i32 { i32::from(b) + ((i32::from(a)-i32::from(b))*(16-t) as i32 >> 4) };
+                        let top = mix(color[c],right[c],fx);
+                        let bottom = mix(below[c],diagonal[c],fx);
+                        color[c] = (bottom + ((top-bottom)*(16-fy) as i32 >> 4)).clamp(0,255) as u8;
                     }
                 }
-                let dst = (y as usize * width as usize + x as usize) * 4;
-                output.rgba[dst..dst + 4].copy_from_slice(&color);
+                let dst = (y as usize * width as usize + x as usize)*4;
+                output.rgba[dst..dst+4].copy_from_slice(&color);
             }
         }
         Some(output)
@@ -610,10 +523,7 @@ impl WaveTable {
                 samples.resize(samples.len().saturating_add(cycle_len), [0, 0]);
             }
         }
-        Self {
-            samples,
-            block_span: cycle_len * block_height,
-        }
+        Self { samples, block_span: cycle_len * block_height }
     }
 
     fn extended(
@@ -648,10 +558,7 @@ impl WaveTable {
                 append_sine_cycle(&mut samples, cycle_len, amplitude, shift);
             }
         }
-        Self {
-            samples,
-            block_span: row_len * block_height,
-        }
+        Self { samples, block_span: row_len * block_height }
     }
 }
 
@@ -1206,6 +1113,24 @@ mod tests {
     use ethornell_vm::Value;
 
     #[test]
+    fn modern_raster_option_vector_clipping_and_nearest_rounding() {
+        let mut effects = RuntimeEffects::default();
+        effects.create_vector_map(1,2,2);
+        for v in &mut effects.vector_maps.get_mut(&1).unwrap().samples {
+            *v = VectorSample { x:2,y:0,phase:0 };
+        }
+        let image = ethornell_image::DecodedImage { width:2,height:2,rgba:vec![10,0,0,255,20,0,0,255,30,0,0,255,40,0,0,255] };
+        effects.clip_vectors_xy = true;
+        let nearest = effects.warp_vector_map(1,&image,&[32767],[0,0],[2,2],false,false).unwrap();
+        assert_eq!(&nearest.rgba[..8], &[20,0,0,255,0,0,0,0]);
+        let linear = effects.warp_vector_map(1,&image,&[32767],[0,0],[2,2],false,true).unwrap();
+        assert_eq!(linear.rgba[4],1); // Never sample the first pixel of row 2.
+        effects.clip_vectors_xy = false;
+        let legacy = effects.warp_vector_map(1,&image,&[32767],[0,0],[2,2],false,true).unwrap();
+        assert_eq!(legacy.rgba[4],29);
+    }
+
+    #[test]
     fn rain_calls_preserve_script_argument_order_and_equal_handle_values() {
         let mut effects = RuntimeEffects::default();
         let handle = match effects.call(0xc0, 0x40, &[Value::Int(720), Value::Int(1280)]) {
@@ -1231,40 +1156,17 @@ mod tests {
 
     #[test]
     fn native_vector_wave_window_and_flat_allocation_wrap() {
-        let mut effects = RuntimeEffects::default();
-        effects.configure_compact_wave_table(&[
-            Value::Int(2),
-            Value::Int(1),
-            Value::Int(4),
-            Value::Int(1),
-            Value::Int(0),
-        ]);
-        assert_eq!(
-            effects.vm_wave_samples(0, 1, 1, 256).unwrap(),
-            [0, 4, 0, -4]
-        );
-        assert!(effects.vm_wave_samples(0, 2, 1, 256).is_none());
-        effects.create_vector_map(1, 2, 1);
-        for v in &mut effects.vector_maps.get_mut(&1).unwrap().samples {
-            *v = VectorSample {
-                x: i16::MAX,
-                y: 0,
-                phase: 0,
-            };
-        }
-        let source = DecodedImage {
-            width: 2,
-            height: 1,
-            rgba: vec![10, 0, 0, 255, 20, 0, 0, 255],
-        };
-        let wrapped = effects
-            .warp_vector_map(1, &source, &[4], [0, 0], [2, 1], true, false)
-            .unwrap();
-        assert_eq!(wrapped.rgba, [20, 0, 0, 255, 10, 0, 0, 255]);
-        let clipped = effects
-            .warp_vector_map(1, &source, &[4], [0, 0], [2, 1], false, false)
-            .unwrap();
-        assert_eq!(clipped.rgba, [20, 0, 0, 255, 0, 0, 0, 0]);
+        let mut effects=RuntimeEffects::default();
+        effects.configure_compact_wave_table(&[Value::Int(2),Value::Int(1),Value::Int(4),Value::Int(1),Value::Int(0)]);
+        assert_eq!(effects.vm_wave_samples(0,1,1,256).unwrap(),[0,4,0,-4]);
+        assert!(effects.vm_wave_samples(0,2,1,256).is_none());
+        effects.create_vector_map(1,2,1);
+        for v in &mut effects.vector_maps.get_mut(&1).unwrap().samples { *v=VectorSample{x:i16::MAX,y:0,phase:0}; }
+        let source=DecodedImage{width:2,height:1,rgba:vec![10,0,0,255,20,0,0,255]};
+        let wrapped=effects.warp_vector_map(1,&source,&[4],[0,0],[2,1],true,false).unwrap();
+        assert_eq!(wrapped.rgba,[20,0,0,255,10,0,0,255]);
+        let clipped=effects.warp_vector_map(1,&source,&[4],[0,0],[2,1],false,false).unwrap();
+        assert_eq!(clipped.rgba,[20,0,0,255,0,0,0,0]);
     }
 
     #[test]

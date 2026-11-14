@@ -30,8 +30,8 @@ impl Vm {
         self.write_i64(destination, result)
     }
 
-    /// 0x55 (BGI 1.647 only) and 0x56/0x57 (sub_4747C0, sub_4747F0): the
-    /// first value popped is the right operand.
+    /// 0x56/0x57 (sub_4747C0, sub_4747F0): the first value popped is the
+    /// right operand.
     pub(super) fn execute_fixed_arithmetic(&mut self, opcode: u8) -> VmResult<i32> {
         let right = self.pop_int()?;
         let left = self.pop_int()?;
@@ -39,12 +39,6 @@ impl Vm {
             0x56 => fixed_mul(left, right),
             0x57 if right == 0 => 0,
             0x57 => float_to_fixed(fixed_to_float(left) / fixed_to_float(right)),
-            // BGI 1.647 0x47C350: both operands become floats, the CRT pow
-            // runs on them and the float result goes through sub_455940.
-            0x55 => float_to_fixed(
-                f64::from(exact_fixed_to_float(left)).powf(f64::from(exact_fixed_to_float(right)))
-                    as f32,
-            ),
             _ => return Err(VmError::UnsupportedInstruction(opcode)),
         })
     }
@@ -212,11 +206,6 @@ fn fixed_mul(left: i32, right: i32) -> i32 {
     ((i64::from(left) * i64::from(right)) >> 16) as i32
 }
 
-/// x87 `fild` times 1/65536 rounded once to a float.
-fn exact_fixed_to_float(value: i32) -> f32 {
-    (f64::from(value) / 65_536.0) as f32
-}
-
 fn fixed_to_float(value: i32) -> f32 {
     value as f32 * (1.0 / 65_536.0)
 }
@@ -304,10 +293,6 @@ mod tests {
         assert_eq!(vm.execute_fixed_arithmetic(0x57).unwrap(), 0x18000);
         vm.stack.extend([Value::Int(3 << 16), Value::Int(0)]);
         assert_eq!(vm.execute_fixed_arithmetic(0x57).unwrap(), 0);
-        vm.stack.extend([Value::Int(2 << 16), Value::Int(3 << 16)]);
-        assert_eq!(vm.execute_fixed_arithmetic(0x55).unwrap(), 8 << 16);
-        vm.stack.extend([Value::Int(4 << 16), Value::Int(0x8000)]);
-        assert_eq!(vm.execute_fixed_arithmetic(0x55).unwrap(), 2 << 16);
     }
 
     #[test]

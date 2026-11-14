@@ -186,23 +186,6 @@ impl HostServices {
     }
 }
 
-/// WinMain leaves its loop once the root interpreter ends: the game's own
-/// exit (Sys80:6A after its "quit?" box) or the end of ipl._bp. A restart has
-/// already replaced the runtime by then, and the new one is not halted.
-fn root_interpreter_ended(
-    vm: &ethornell_vm::Vm,
-    report: Option<&ethornell_vm::VmRunReport>,
-) -> bool {
-    vm.halted
-        && report.is_some_and(|report| {
-            matches!(
-                report.stop_reason,
-                ethornell_vm::VmStopReason::InterpreterTerminated
-                    | ethornell_vm::VmStopReason::Completed
-            )
-        })
-}
-
 pub struct HostRuntime {
     runtime: RuntimeEngine,
     policy: file_policy::FilePolicy,
@@ -251,11 +234,13 @@ impl HostRuntime {
             (None, Some(path)) => {
                 ethornell_render::FontProvider::load_file(path, config.font_face_index)?
             }
-            (None, None) => ethornell_render::FontProvider::load_system_for_text(if config.gbk {
-                "A日本語中文简体繁體"
-            } else {
-                "A日本語中文"
-            })?,
+            (None, None) => {
+                let required = if config.gbk { "A日本語中文简体繁體" } else { "A日本語中文" };
+                match file_policy::scope(&policy, || game_font::load(&policy.resource, required)) {
+                    Some(font) => font,
+                    None => ethornell_render::FontProvider::load_system_for_text(required)?,
+                }
+            }
         };
         let font = match &config.fallback_font {
             Some((path, face)) => ethornell_render::FallbackFont::new(
@@ -295,6 +280,16 @@ impl HostRuntime {
                 "launcher overlay"
             );
         }
+        // Upstream's language view. Our launcher overlay and `.chs` override
+        // archives can carry the bootstrap where upstream does not look, so a
+        // missing language bootstrap keeps the whole manager.
+        let manager = match manager.for_native_bootstrap(None) {
+            Ok(view) => view,
+            Err(err) => {
+                tracing::warn!(%err, "no language bootstrap view; using every archive");
+                manager
+            }
+        };
         let bytes = manager.read_decoded_from_archive("system.arc", "ipl._bp")?;
         let mut runtime = file_policy::scope(&policy, || {
             snapshot::with_font(&font, || {
@@ -604,6 +599,7 @@ impl HostRuntime {
         self.runtime.api.input_down_descriptors.clear();
         self.runtime.api.input_down_reported.clear();
         self.runtime.api.mouse_pressed = false;
+        self.runtime.api.graph_icon_press_consumed = false;
         self.runtime.api.last_button_press = None;
         self.runtime.api.suppress_message_mouse_release = false;
         for input in self.runtime.api.graph_input_objects.values_mut() {
@@ -834,9 +830,7 @@ impl HostRuntime {
                 text: title,
             });
         }
-        if self.runtime.api.quit_requested
-            || root_interpreter_ended(&self.runtime.vm, report.last_report.as_ref())
-        {
+        if self.runtime.api.quit_requested || self.runtime.normal_root_completion() {
             self.close();
             return Ok(());
         }
@@ -868,6 +862,7 @@ impl HostRuntime {
         self.sync_audio()
     }
     fn close(&mut self) {
+        if self.closed { return; }
         self.closed = true;
         self.runtime.vm.cancel_host_requests();
         self.runtime.api.host.pending.clear();
@@ -986,6 +981,17 @@ impl HostRuntime {
 }
 
 impl RuntimeEngine {
+    fn normal_root_completion(&self) -> bool {
+        self.vm.halted
+            && self.api.native_system.restart.is_none()
+            && self.api.native_system.bootstrap_request.is_none()
+            && self.last_report.as_ref().is_some_and(|report| matches!(
+                report.stop_reason,
+                ethornell_vm::VmStopReason::Completed
+                    | ethornell_vm::VmStopReason::InterpreterTerminated
+            ))
+    }
+
     fn new_explicit(
         script: &str,
         bytes: &[u8],
@@ -1003,6 +1009,7 @@ impl RuntimeEngine {
             4096,
         );
         vm.set_native_abi_profile(profile.abi);
+        vm.set_modern_pointer_tags(profile.modern_pointer_tags);
         vm.set_graph_text_encoding(encoding);
         vm.start(&program);
         Self {
@@ -1011,6 +1018,7 @@ impl RuntimeEngine {
                 let mut api = RuntimeTraceApi::new_with_native_root(manager, root);
                 api.configure_for_dialect(program.dialect);
                 api.configure_native_sound_channels(profile.se_channels);
+                api.modern_gradient_blur = profile.modern_gradient_blur;
                 api
             },
             options: ethornell_vm::VmRunOptions {
@@ -1034,6 +1042,40 @@ mod tests {
         api.host.enabled = true;
         api
     }
+    #[test]
+    fn normal_root_completion_respects_children_yields_and_restarts() {
+        let create = |bytes: &[u8]| RuntimeEngine::new_explicit(
+            "root", bytes, ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap(),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")), false, false, encoding_rs::SHIFT_JIS,
+        );
+        let advance = |runtime: &mut RuntimeEngine| {
+            runtime.last_report = Some(runtime.vm.run_loaded(&mut runtime.api, &runtime.options));
+        };
+        for bytes in [&[0x80, 0x6a][..], &[0x17][..]] {
+            let mut runtime = create(bytes);
+            advance(&mut runtime);
+            assert!(runtime.normal_root_completion());
+            runtime.api.native_system.restart = Some(("".into(), "".into(), None));
+            assert!(!runtime.normal_root_completion());
+            runtime.api.native_system.restart = None;
+            runtime.api.native_system.bootstrap_request = Some((None, "system.arc".into(), "ipl._bp".into()));
+            assert!(!runtime.normal_root_completion());
+        }
+        let mut yielding = create(&[0x80, 0x5f, 0x17]);
+        advance(&mut yielding);
+        assert!(!yielding.normal_root_completion());
+        // Child entry at 0x1a returns while the root keeps yielding at 0x14.
+        let mut parent = create(&[
+            0x02,4,0,0,0, 0x02,0,1,0,0, 0x02,0,1,0,0,
+            0x06,0x0b,0, 0x81,0x44, 0x80,0x5f, 0x06,0xfe,0xff, 0x14, 0x17,
+        ]);
+        for _ in 0..4 {
+            advance(&mut parent);
+            assert!(!parent.last_report.as_ref().unwrap().stop_reason.is_fatal());
+            assert!(!parent.normal_root_completion());
+        }
+    }
+
     #[test]
     fn user_dialog_requests_become_kind_five_events_with_json_payloads() {
         let mut api = api();
@@ -1225,7 +1267,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an authorized read-only sample via ETHORNELL_RESTRICTED_REPRO_GAME; private temporary user root"]
-    #[cfg(unix)]
+    #[cfg(all(unix, debug_assertions))]
     fn authorized_sample_restricted_vm_baseline() {
         if std::env::var_os("ETHORNELL_RESTRICTED_TRACE").is_some() {
             ethornell_core::init_tracing();
@@ -1518,10 +1560,8 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(root_interpreter_ended(
-            &host.runtime.vm,
-            report.last_report.as_ref()
-        ));
+        let _ = report;
+        assert!(host.runtime.normal_root_completion());
         drop(host);
         std::fs::remove_dir_all(root).unwrap();
     }

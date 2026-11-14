@@ -3,12 +3,49 @@ use crate::native_landscape::{
     LANDSCAPE_HANDLE, LANDSCAPE_NO_COLUMNS, LANDSCAPE_NO_MAP, landscape_error,
 };
 
+#[cfg(test)]
+mod raster_option_abi_tests {
+    use super::*;
+    use ethornell_vm::{NativeAbiProfile, Value, Vm, VmRunOptions, VmStopReason};
+
+    #[test]
+    fn raster_option_native_abis_preserve_operand_order_and_result_contract() {
+        let manager = ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let program = ethornell_script::parse_bp_program(Some("raster-options".into()), &[0x91, 0x0a, 0x17]);
+        for profile in [NativeAbiProfile::Anipani, NativeAbiProfile::HoukagoFd, NativeAbiProfile::Modern] {
+            let mut api = RuntimeTraceApi::new(manager.clone());
+            for (key, value, accepted) in [
+                (0x0122_0000u32, 1, true), (0x0122_0000, 2, true),
+                (0x8011_1600, 1, true), (0x8011_1600, -1, true),
+                (0xdead_beef, 1, false),
+            ] {
+                let mut vm = Vm::new();
+                vm.set_native_abi_profile(profile);
+                vm.start(&program);
+                vm.stack = vec![Value::Int(73), Value::Int(key as i32), Value::Int(value)];
+                let before = (api.native_additive_coverage, api.effects.clip_vectors_xy);
+                let report = vm.run_loaded(&mut api, &VmRunOptions { fail_on_stub: true, ..Default::default() });
+                assert_eq!(report.stop_reason, VmStopReason::Completed, "{profile:?}: {report:?}");
+                assert_eq!(vm.stack, vec![Value::Int(73), Value::Int(i32::from(accepted))]);
+                let after = (api.native_additive_coverage, api.effects.clip_vectors_xy);
+                match key {
+                    0x0122_0000 => assert_eq!(after, (value == 1, before.1)),
+                    0x8011_1600 => assert_eq!(after, (before.0, value == 1)),
+                    _ => assert_eq!(after, before),
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Graph91FontTransform {
     pub scale_x: i32,
     pub scale_y: i32,
     pub offset_x: i32,
     pub offset_y: i32,
+    /// FD fifth parameter: signed 16.16 addition to proportional advance.
+    pub tracking: i32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -231,6 +268,27 @@ pub(super) struct Graph91FontConfig {
 }
 
 impl RuntimeTraceApi {
+    pub(super) fn register_native_named_font_transform(&mut self, name: &str, values: [i32; 5]) -> ethornell_vm::VmResult<()> {
+        let [scale_x, scale_y, offset_x, offset_y, tracking] = values;
+        // FD 434AA0 (legacy 42EF10 plus the fifth tracking parameter).
+        if !(-65536..=65536).contains(&tracking) {
+            return Err(ethornell_vm::VmError::Runtime(format!("無効なパラメータ数 [ {tracking} ] が指定されました")));
+        }
+        if values[..4] != [0, 0, 0, 0] {
+            let in_range = |v| (65536..=131072).contains(&v);
+            if !(scale_x == 0 || in_range(scale_x)) || !in_range(scale_y) {
+                return Err(ethornell_vm::VmError::Runtime(format!("無効な倍率 [ 0x{:05X} , 0x{:05X} ] が指定されました", scale_x as u32, scale_y as u32)));
+            }
+            let sx = if scale_x == 0 { scale_y } else { scale_x };
+            let limit = |scale| (65536.0 - 4294967296.0 / f64::from(scale)) as i32;
+            if offset_x > limit(sx) || offset_y > limit(scale_y) {
+                return Err(ethornell_vm::VmError::Runtime(format!("無効な座標 [ 0x{:05X} , 0x{:05X} ] が指定されました", offset_x as u32, offset_y as u32)));
+            }
+        }
+        self.graph91_font_transforms.insert(name.to_ascii_lowercase(), Graph91FontTransform { scale_x, scale_y, offset_x, offset_y, tracking });
+        Ok(())
+    }
+
     pub(super) fn dispatch_system91_03_1f(
         &mut self,
         call: &mut ethornell_vm::NativeCallFrame,
@@ -251,12 +309,38 @@ impl RuntimeTraceApi {
                 let _ = pop_int_value(stack);
                 ethornell_vm::Value::None
             }
-            // BGI 1.647 only (0x488B90 -> 0x407F30): sets renderer option
-            // 0x01220000 or 0x80111600 and returns 1, any other key returns 0.
-            0x0a => {
-                let _value = pop_int_value(stack);
-                let key = pop_int_value(stack).unwrap_or_default() as u32;
-                ethornell_vm::Value::Int(i32::from(matches!(key, 0x0122_0000 | 0x8011_1600)))
+            0x05 => {
+                if stack.len() != 4 { return Some(Err(ethornell_vm::VmError::UnknownDispatch { group:0x91, id })); }
+                // Lovepical 4E33D0 -> 491B80 -> 482450: draw into an
+                // existing RGB bitmap through priority, translated by -x/-y.
+                let priority = pop_int_value(stack).unwrap_or_default();
+                let y = pop_int_value(stack).unwrap_or_default();
+                let x = pop_int_value(stack).unwrap_or_default();
+                let bitmap = pop_int_value(stack).unwrap_or_default();
+                let status = match ethornell_vm::GraphApi::query_bitmap_info(self, bitmap) {
+                    None => 2,
+                    Some(info) if info.format != 1 => 1,
+                    Some(info) => {
+                        // 482450 clears the existing bitmap before traversal;
+                        // a displayed reference to that same resource must not
+                        // feed its old pixels back into the capture.
+                        if let Some(mut pixels) = self.graph_bitmap_image(bitmap) {
+                            for pixel in pixels.rgba.as_chunks_mut::<4>().0 { *pixel = [0,0,0,255]; }
+                            self.replace_graph_bitmap_pixels(bitmap, pixels);
+                        }
+                        self.clear_bitmap_text(bitmap);
+                        self.refresh_linked_sprite_masks();
+                        self.refresh_native_sprite_filters();
+                        self.refresh_native_filters();
+                        let capture = crate::snapshot::compose_runtime_region(self, true, Some(priority), [x,y], (info.width,info.height));
+                        if !self.replace_graph_bitmap_pixels(bitmap, capture) {
+                            return Some(Err(ethornell_vm::VmError::Runtime("native scene capture destination disappeared".into())));
+                        }
+                        self.clear_bitmap_text(bitmap);
+                        0
+                    }
+                };
+                ethornell_vm::Value::Int(status)
             }
             0x06 => {
                 // sub_4806D0 pops Y first and X second.
@@ -268,6 +352,24 @@ impl RuntimeTraceApi {
                 tracing::info!(x, y, "GraphSetGlobalDisplayOffset");
                 self.trace_graph(format!("global display offset=({x},{y}) (91:06)"));
                 ethornell_vm::Value::None
+            }
+            0x0a => {
+                if stack.len() != 2 { return Some(Err(ethornell_vm::VmError::UnknownDispatch { group:0x91, id })); }
+                // Legacy 48A600 -> 401EC0 -> 408840 and FD
+                // 495740 -> 402150 -> 408D10. Unknown keys return false;
+                // only value == 1 selects the alternate native pixel path.
+                let value = pop_int_value(stack).unwrap_or_default();
+                let key = pop_int_value(stack).unwrap_or_default() as u32;
+                let accepted = match key {
+                    0x0122_0000 => { self.native_additive_coverage = value == 1; true },
+                    0x8011_1600 => { self.effects.clip_vectors_xy = value == 1; true },
+                    _ => false,
+                };
+                if accepted {
+                    self.effects.vector_revision = self.effects.vector_revision.wrapping_add(1);
+                    self.graph_redraw_requested = Some(true);
+                }
+                ethornell_vm::Value::Int(i32::from(accepted))
             }
             0x0b => {
                 self.graph91_script_bitmap_context_binding_enabled =
@@ -295,36 +397,8 @@ impl RuntimeTraceApi {
                 let scale_y = pop_int_value(stack).unwrap_or_default();
                 let scale_x = pop_int_value(stack).unwrap_or_default();
                 let name = pop_string_value(stack).unwrap_or_default();
-                // sub_42EF10: all zero is accepted; else the X scale is 0 or
-                // 0x10000..=0x20000, the Y scale 0x10000..=0x20000 (0x80000005)
-                // and each offset at most 65536 - 2^32 / scale (0x80000006).
-                if !(scale_x == 0 && scale_y == 0 && offset_x == 0 && offset_y == 0) {
-                    let in_range = |value: i32| (0x1_0000..=0x2_0000).contains(&value);
-                    if !(scale_x == 0 || in_range(scale_x)) || !in_range(scale_y) {
-                        return Some(Err(ethornell_vm::VmError::Runtime(format!(
-                            "無効な倍率 [ 0x{:05X} , 0x{:05X} ] が指定されました",
-                            scale_x as u32, scale_y as u32
-                        ))));
-                    }
-                    let x_scale = if scale_x == 0 { scale_y } else { scale_x };
-                    let limit = |scale: i32| (65536.0 - 4294967296.0 / f64::from(scale)) as i32;
-                    if offset_x > limit(x_scale) || offset_y > limit(scale_y) {
-                        return Some(Err(ethornell_vm::VmError::Runtime(format!(
-                            "無効な座標 [ 0x{:05X} , 0x{:05X} ] が指定されました",
-                            offset_x as u32, offset_y as u32
-                        ))));
-                    }
-                }
-                {
-                    self.graph91_font_transforms.insert(
-                        name.to_ascii_lowercase(),
-                        Graph91FontTransform {
-                            scale_x,
-                            scale_y,
-                            offset_x,
-                            offset_y,
-                        },
-                    );
+                if let Err(error) = self.register_native_named_font_transform(&name, [scale_x, scale_y, offset_x, offset_y, 0]) {
+                    return Some(Err(error));
                 }
                 ethornell_vm::Value::None
             }
@@ -2686,6 +2760,11 @@ impl RuntimeTraceApi {
 
     /// sub_428320(-1): Sprite+0x154 = 0, +0x158 = -1; +0x160 stays.
     pub(super) fn graph91_clear_sprite_mask(&mut self, sprite: i32) {
+        self.discard_linked_sprite_draw(sprite);
+        if let Some((key, _)) = self.aux_masked_sprites.remove(&sprite) {
+            self.graph_images.remove(&key);
+            self.graph_image_revisions.remove(&key);
+        }
         if let Some(properties) = self.graph_object_properties.get_mut(&sprite) {
             properties.aux_resource = None;
         }

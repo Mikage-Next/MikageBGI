@@ -18,6 +18,7 @@ mod debug_trace;
 mod display_tree;
 mod effects;
 mod file_policy;
+mod native_profile;
 mod frame_presenter;
 /// File roots for hosts without directory descriptors (web, consoles).
 #[cfg(hosted_files)]
@@ -28,6 +29,8 @@ mod graph;
 mod graph_bitmap_nodes;
 mod graph_color;
 mod graph_config;
+mod font_transform;
+mod game_font;
 mod graph_defaults;
 mod graph_effect;
 #[cfg(not(any(target_os = "vita", target_os = "horizon")))]
@@ -67,6 +70,7 @@ mod native_selection;
 mod native_sound;
 mod native_sprite_filters;
 mod native_sprite_mask;
+mod native_sprite_link;
 mod native_sprite_perspective;
 mod native_system;
 mod native_user;
@@ -228,6 +232,8 @@ fn configured_game_id(manager: &ResourceManager) -> (String, &'static str) {
 struct NativeRuntimeProfile {
     abi: ethornell_vm::NativeAbiProfile,
     se_channels: usize,
+    modern_gradient_blur: bool,
+    modern_pointer_tags: bool,
     main_code_bytes: u32,
     main_data_bytes: u32,
 }
@@ -237,6 +243,8 @@ impl Default for NativeRuntimeProfile {
         Self {
             abi: ethornell_vm::NativeAbiProfile::Tayutama,
             se_channels: 64,
+            modern_gradient_blur: false,
+            modern_pointer_tags: false,
             main_code_bytes: 0x80000,
             main_data_bytes: 0x40000,
         }
@@ -244,7 +252,13 @@ impl Default for NativeRuntimeProfile {
 }
 
 fn confirmed_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> NativeRuntimeProfile {
-    // Session version detection uses two exact code-resource fingerprints,
+    let mut profile = resource_native_profile(manager, bootstrap);
+    native_profile::apply(manager, &mut profile);
+    profile
+}
+
+fn resource_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> NativeRuntimeProfile {
+    // Session version detection uses confirmed code-resource pairs,
     // never graph encoding, Android target, an arbitrary ID or .exe execution.
     // FNV64 is an identity/version hint, not a security signature; IO remains
     // restricted regardless of this profile.
@@ -261,6 +275,10 @@ fn confirmed_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> Nati
         (10176, CONFIRMED_BOOTSTRAP_FNV) => {
             Some((CONFIRMED_TITLE_LEN, CONFIRMED_TITLE_FNV, amachoco))
         }
+        // Animal Panic 48A5E0 -> 498990 -> 464000: the resource-mode
+        // selector matches, without importing unrelated later text signatures.
+        (7664, 0x8ba4d6240ac73523) => Some((26064, 0xec4630efb73656f1,
+            NativeRuntimeProfile { abi: ethornell_vm::NativeAbiProfile::Anipani, ..NativeRuntimeProfile::default() })),
         // Japanese retail release, system.arc dated 2019-12-10.
         (7536, 0xaa1f17da017b7c27) => Some((24368, 0xe221d8b4be4f097a, amachoco)),
         // Houkago Cinderella FD's validator sub_4A6C30 accepts SE 0..128.
@@ -270,6 +288,48 @@ fn confirmed_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> Nati
             0x603c84fe0ba8bc49,
             NativeRuntimeProfile {
                 se_channels: 128,
+                main_code_bytes: 0x800000,
+                main_data_bytes: 0x400000,
+                ..NativeRuntimeProfile::default()
+            },
+        )),
+        // Houkago Cinderella 2 FD: sub_4ADB30 validates SE indices <128;
+        // startup sub_4A0DD0 allocates 8 MiB code / 4 MiB data.
+        (10144, 0x93e09e85cc7cc4b2) => Some((
+            14864,
+            0x2ae5953033ee96e5,
+            NativeRuntimeProfile {
+                se_channels: 128,
+                abi: ethornell_vm::NativeAbiProfile::HoukagoFd,
+                modern_gradient_blur: true,
+                main_code_bytes: 0x800000,
+                main_data_bytes: 0x400000,
+                ..NativeRuntimeProfile::default()
+            },
+        )),
+        // lovepical: original pointer resolver uses code/data tags 1/2 <<28;
+        // native startup still allocates 8 MiB code / 4 MiB data, 128 SE slots.
+        (14320, 0xce17f41f47bd9ebd) => Some((
+            13200, 0xe03d3384de352602,
+            NativeRuntimeProfile {
+                se_channels: 128,
+                abi: ethornell_vm::NativeAbiProfile::Modern,
+                modern_gradient_blur: true,
+                modern_pointer_tags: true,
+                main_code_bytes: 0x800000,
+                main_data_bytes: 0x400000,
+                ..NativeRuntimeProfile::default()
+            },
+        )),
+        // dokai: original pointer resolver uses code/data tags 1/2 <<28;
+        // native startup still allocates 8 MiB code / 4 MiB data, 128 SE slots.
+        (14320, 0xc2ea2dbd2a040102) => Some((
+            13200, 0x23b31f6761fd962c,
+            NativeRuntimeProfile {
+                se_channels: 128,
+                abi: ethornell_vm::NativeAbiProfile::Modern,
+                modern_gradient_blur: true,
+                modern_pointer_tags: true,
                 main_code_bytes: 0x800000,
                 main_data_bytes: 0x400000,
                 ..NativeRuntimeProfile::default()
@@ -343,8 +403,6 @@ pub fn show_error(title: &str, text: &str) {
 }
 
 pub fn run(config: AppConfig) -> Result<()> {
-    let font = snapshot::load_default_font()?;
-    let _font_session = snapshot::enter_font_session(&font);
     let headless = config.headless || std::env::var_os("ETHORNELL_GUI_HEADLESS").is_some();
     // A full recursive magic probe opens every loose file in the game tree and
     // is diagnostic work, not runtime initialization. Keep it behind --trace;
@@ -361,6 +419,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         );
     }
     let manager = ResourceManager::open_game(config.game_root.path())?;
+    let manager = if config.script.is_none() { manager.for_native_bootstrap(None)? } else { manager };
     tracing::info!(
         archives = manager.archives().archives.len(),
         resources = manager.resource_count(),
@@ -377,6 +436,8 @@ pub fn run(config: AppConfig) -> Result<()> {
     };
     #[cfg(not(desktop_host))]
     let encoding = encoding_rs::SHIFT_JIS;
+    let font = snapshot::load_game_font(config.game_root.path(), encoding == encoding_rs::GBK)?;
+    let _font_session = snapshot::enter_font_session(&font);
     let bgm = load_runtime_bgm(&manager);
     let native_root = game_root_path(&manager);
     tracing::info!(
@@ -394,30 +455,22 @@ pub fn run(config: AppConfig) -> Result<()> {
         manager.read_decoded_from_archive("system.arc", "ipl._bp")
     };
     tracing::info!(script = startup_script, "selected runtime bootstrap script");
-    let runtime = match Some(startup_script) {
-        Some(script) => match startup_bytes {
-            Ok(bytes) => Some(RuntimeEngine::new(
-                script,
-                &bytes,
-                manager.clone(),
-                native_root,
-                config.trace,
-                config.fail_on_stub,
-                !headless,
-                encoding,
-            )),
-            Err(err) => {
-                tracing::warn!(script, %err, "startup script unavailable");
-                None
-            }
-        },
-        None => None,
-    };
-    let image = if runtime.is_some() {
-        None
-    } else {
-        Some(load_runtime_image(&manager)?)
-    };
+    // A title bitmap cannot substitute for a running interpreter: it has no
+    // native button objects, input handlers or title script state.
+    let bytes = startup_bytes.map_err(|error| EthornellError::Other(format!(
+        "native bootstrap {startup_script} could not be loaded: {error}"
+    )))?;
+    let runtime = Some(RuntimeEngine::new(
+        startup_script,
+        &bytes,
+        manager.clone(),
+        native_root,
+        config.trace,
+        config.fail_on_stub,
+        !headless,
+        encoding,
+    ));
+    let image: Option<DecodedImage> = None;
     if config.trace
         && let Some(image) = image.as_ref()
     {
@@ -1040,6 +1093,7 @@ struct RuntimeTraceApi {
     /// Sprite+0x154 raised by a 91:55 link (sub_4290F0) rather than by a
     /// 90:55 grayscale bitmap.
     graph91_sprite_link_masks: BTreeSet<i32>,
+    linked_sprite_draws: BTreeMap<i32, native_sprite_link::LinkedSpriteDraw>,
     /// Target System91:60-69 CDspObjEffector registry: 8 tagged slots.
     graph91_effectors: BTreeMap<i32, native_graph_sys91::Graph91EffectorState>,
     /// Target System91:70-7F CDspObjLandscape registry: 4 tagged slots.
@@ -1250,6 +1304,8 @@ struct RuntimeTraceApi {
     auto_user_click_hovered_frames: u32,
     frame_yield_requested: bool,
     native_dialog_presentation: bool,
+    modern_gradient_blur: bool,
+    native_additive_coverage: bool,
     pending_transition_destination: Option<i32>,
     pending_window_title: Option<String>,
     pending_window_position: Option<(i32, i32)>,
@@ -1271,6 +1327,9 @@ struct RuntimeTraceApi {
     /// dword_566778 / dword_56677C: the last left/right press went to a Knob.
     left_press_captured: bool,
     right_press_captured: bool,
+    /// Keep icon ownership until physical release, even if activation replaces
+    /// the input processor or the per-tick pending edge has been drained.
+    graph_icon_press_consumed: bool,
     /// IsIconic(hWndParent), refreshed by the window frontend.
     window_iconic: bool,
     /// dword_566708: set by Sys80:65, cleared when the window is activated
@@ -1486,6 +1545,7 @@ impl RuntimeTraceApi {
                 native_graph_sys91::Graph91MultiLayerBackgroundState::default(),
             graph91_sprite_relations: BTreeMap::new(),
             graph91_sprite_link_masks: BTreeSet::new(),
+            linked_sprite_draws: BTreeMap::new(),
             graph91_effectors: BTreeMap::new(),
             graph91_landscapes: BTreeMap::new(),
             queued_system_events: VecDeque::new(),
@@ -1656,6 +1716,8 @@ impl RuntimeTraceApi {
             auto_user_click_hovered_frames: 0,
             frame_yield_requested: false,
             native_dialog_presentation: false,
+            modern_gradient_blur: false,
+            native_additive_coverage: false,
             pending_transition_destination: None,
             pending_window_title: None,
             pending_window_position: None,
@@ -1673,6 +1735,7 @@ impl RuntimeTraceApi {
             window_focused: true,
             left_press_captured: false,
             right_press_captured: false,
+            graph_icon_press_consumed: false,
             window_iconic: false,
             window_minimize_latch: false,
             window_center_lock: 0,
@@ -1946,6 +2009,7 @@ impl RuntimeTraceApi {
         // sub_442EE0 (CreateWorkBitmap) copies the whole current back buffer
         // into the new bitmap; sub_442F80 (CreatePrioritizedWorkBitmap)
         // renders the display tree up to the given priority into it.
+        self.refresh_linked_sprite_masks();
         self.refresh_native_sprite_filters();
         self.refresh_native_filters();
         let captured = snapshot::compose_runtime_frame_through_priority(self, true, priority);
@@ -2555,7 +2619,7 @@ impl RuntimeTraceApi {
                                 .map(|pair| (pair[0], pair[1]))
                         })
                         .unwrap_or((0, 0));
-                    bitmap_blend::blit_mode(
+                    bitmap_blend::blit_mode_with_options(
                         base,
                         *base_format,
                         &image,
@@ -2564,6 +2628,7 @@ impl RuntimeTraceApi {
                         y,
                         element.mode,
                         element.parameter,
+                        self.native_additive_coverage,
                     );
                 }
             }
@@ -3770,6 +3835,26 @@ impl RuntimeTraceApi {
         true
     }
 
+    /// BGI 1.652 Sys81:0E (0x494B70 -> 0x467430) reads the initialized
+    /// adapter dimensions, not an unavailable `(0, 0)` display. Hosted mobile
+    /// and web sessions use their full-screen surface; a CPU/headless session
+    /// uses the native canvas as its virtual display until a host supplies one.
+    /// Returning zero makes scripts exhaust their resolution choices and can
+    /// select an unrelated legacy mode. Do not constrain Sys80:60 mode changes.
+    fn available_display_size(&self) -> (u32, u32) {
+        match self.desktop_display_size {
+            (width, height) if width > 0 && height > 0 => (width, height),
+            _ if self.window_surface_width > 0 && self.window_surface_height > 0 => (
+                self.window_surface_width as u32,
+                self.window_surface_height as u32,
+            ),
+            _ => (
+                self.screen_width.max(1) as u32,
+                self.screen_height.max(1) as u32,
+            ),
+        }
+    }
+
     /// sub_45EDE0: mode 2 falls back to 0 when the adjusted desktop
     /// (sub_45EAE0(.., 1)) is narrower or lower than the display mode.
     pub(crate) fn effective_fullscreen_scale_mode(&self) -> i32 {
@@ -3777,7 +3862,7 @@ impl RuntimeTraceApi {
         if mode != 2 {
             return mode;
         }
-        let (mut width, mut height) = self.desktop_display_size;
+        let (mut width, mut height) = self.available_display_size();
         if height != 0 && 4u32.wrapping_mul(width) / height >= 10 {
             width >>= 1;
         }
@@ -3962,9 +4047,7 @@ impl RuntimeTraceApi {
         removed |= self.graph91_object_transforms.remove(&object).is_some();
         removed |= self.graph91_effectors.remove(&object).is_some();
         removed |= self.graph91_landscapes.remove(&object).is_some();
-        self.graph91_sprite_relations
-            .retain(|sprite, linked| *sprite != object && *linked != object);
-        self.graph91_sprite_link_masks.remove(&object);
+        self.release_sprite_relations(object);
         removed |= self.graph_input_objects.remove(&object).is_some();
         removed |= self.graph_object_properties.remove(&object).is_some();
         removed |= self.graph_mode5_render_states.remove(&object).is_some();
@@ -6202,6 +6285,8 @@ impl RuntimeTraceApi {
             return false;
         }
         self.graph_layers.remove(&target);
+        self.refresh_linked_sprite_masks();
+        self.refresh_native_sprite_filters();
         self.refresh_native_filters();
         let source = snapshot::compose_runtime_frame(self, false);
         let image = match displacement {
@@ -7215,6 +7300,8 @@ impl RuntimeTraceApi {
 
     fn render_graph_object_to_bitmap(&mut self, object_id: i32, bitmap_id: i32) -> bool {
         let target_size = self.bitmap_dimensions.get(&bitmap_id).copied();
+        self.refresh_linked_sprite_masks();
+        self.refresh_native_sprite_filters();
         let Some(image) = snapshot::compose_graph_object(self, object_id, target_size) else {
             return false;
         };
@@ -7570,7 +7657,7 @@ impl RuntimeTraceApi {
         // kernel does not implement leaves the destination unchanged.
         // Bitmaps whose format is unknown keep the portable compositor.
         let native = match (source_format, destination_format) {
-            (Some(sf), Some(df)) => Some(bitmap_blend::blit_mode(
+            (Some(sf), Some(df)) => Some(bitmap_blend::blit_mode_with_options(
                 &mut destination_image,
                 df,
                 &source_image,
@@ -7579,6 +7666,7 @@ impl RuntimeTraceApi {
                 y,
                 mode,
                 alpha_parameter,
+                self.native_additive_coverage,
             )),
             _ => None,
         };
@@ -8202,6 +8290,13 @@ impl RuntimeTraceApi {
     }
 
     fn graph_draw_items(&self) -> Vec<RuntimeGraphDrawItem> {
+        self.graph_draw_items_with_link_masks(false)
+    }
+
+    fn graph_draw_items_with_link_masks(&self, include_masks: bool) -> Vec<RuntimeGraphDrawItem> {
+        let mask_owners = if include_masks {
+            self.graph91_sprite_relations.values().copied().collect::<BTreeSet<_>>()
+        } else { BTreeSet::new() };
         let mut items = Vec::new();
         // Compatibility-only title items are added only when the target graph
         // scripts have loaded resources but have not yet materialized matching
@@ -8212,7 +8307,8 @@ impl RuntimeTraceApi {
         let mut inactive_backgrounds = BTreeSet::new();
         let mut backf_secondaries = Vec::new();
         for (layer_id, layer) in &self.graph_layers {
-            if !self.should_draw_graph_layer(*layer_id, layer) {
+            let is_link_mask = mask_owners.contains(&layer.owner_object.unwrap_or(*layer_id));
+            if !is_link_mask && !self.should_draw_graph_layer(*layer_id, layer) {
                 continue;
             }
             let owner_background = layer
@@ -8387,21 +8483,31 @@ impl RuntimeTraceApi {
                 .map(|surface| self.surface_display_opacity(surface))
                 .unwrap_or(1.0)
                 * opacity;
-            if opacity <= 0.001 {
+            if opacity <= 0.001 && !is_link_mask {
                 continue;
             }
-            if layer.target_surface.is_some_and(|surface| {
+            if !is_link_mask && layer.target_surface.is_some_and(|surface| {
                 self.graph_surfaces
                     .get(&surface)
                     .is_some_and(|record| !self.surface_display_chain_visible(surface, record))
             }) {
                 continue;
             }
+            // A bitmap mutation may move an archive-backed slot to a runtime
+            // image without reconfiguring its sprites (e.g. Graph90:13).
+            // Resolve raw primary bindings live; retain generated mode rasters.
+            let raw_sprite = self.display_tree.kind(layer.owner_object.unwrap_or(*layer_id))
+                == Some(NativeDisplayKind::Sprite)
+                && (!layer.key.starts_with("runtime:") || layer.key.starts_with("runtime:bitmap:"));
+            let primary = node_properties.or(owner_properties).and_then(|p| p.format_resource);
+            let primary_key = primary.and_then(|bitmap| self.resolve_resource_key(bitmap));
+            if raw_sprite && primary.is_some() && primary_key.is_none() { continue; }
             let draw_key = self
                 .aux_masked_sprites
                 .get(layer_id)
                 .map(|(key, _)| key.as_str())
                 .or_else(|| self.message_control_layer_draw_key(*layer_id, layer))
+                .or_else(|| raw_sprite.then_some(primary_key).flatten())
                 .unwrap_or(layer.key.as_str());
             let Some(image) = self.graph_images.get(draw_key) else {
                 continue;
@@ -8576,8 +8682,11 @@ impl RuntimeTraceApi {
         // Native CObjectManager inserts equal-depth objects after existing
         // entries. Preserve that chain order; the old reversed order is only
         // available through ETHORNELL_LEGACY_REVERSE_EQUAL_DEPTH.
+        items.retain_mut(|item| include_masks || self.apply_linked_sprite_draw(item));
         for item in &mut items {
-            self.apply_filtered_sprite_draw(item);
+            if !include_masks {
+                self.apply_filtered_sprite_draw(item);
+            }
             if let Some(object) = item.owner_object {
                 let key = if item.key.starts_with("runtime:landscape:") {
                     item.key
@@ -9616,6 +9725,7 @@ impl RuntimeEngine {
             4096,
         );
         vm.set_native_abi_profile(profile.abi);
+        vm.set_modern_pointer_tags(profile.modern_pointer_tags);
         vm.set_graph_text_encoding(encoding);
         vm.start(&program);
         Self {
@@ -9624,6 +9734,7 @@ impl RuntimeEngine {
                 let mut api = RuntimeTraceApi::new_with_native_root(manager, native_root);
                 api.configure_for_dialect(program.dialect);
                 api.configure_native_sound_channels(profile.se_channels);
+                api.modern_gradient_blur = profile.modern_gradient_blur;
                 api.native_dialog_presentation = native_dialog_presentation;
                 api
             },
@@ -9670,11 +9781,13 @@ impl RuntimeEngine {
             None => self.api.native_root.clone(),
         };
         // The same root keeps the session's manager (a host's launcher
-        // overlay included).
+        // overlay and language view included).
         let manager = if native_root == self.api.native_root {
             self.api.manager.clone()
         } else {
-            match ResourceManager::open_game(&native_root) {
+            match ResourceManager::open_game(&native_root)
+                .and_then(|manager| manager.for_native_bootstrap(self.api.manager.archive_language()))
+            {
                 Ok(manager) => manager,
                 Err(err) => {
                     tracing::warn!(%err, root = %native_root.display(), "bootstrap root unusable");
@@ -9830,8 +9943,16 @@ impl RuntimeEngine {
         // rule. Do not replay missed VM frames after a delayed redraw.
         self.api.advance_audio_clocks(audio_elapsed_ms);
         if self.api.native_user.has_blocking_message() {
+            // A native MessageBox suspends the host loop. The last VM report
+            // can still describe an unrelated bitmap procedure installed in
+            // that pass; it is not the reason this frame makes no progress.
+            let last_report = self.last_report.clone().map(|mut report| {
+                report.steps = 0;
+                report.stop_reason = ethornell_vm::VmStopReason::WaitingForHost;
+                report
+            });
             return RuntimeFrameReport {
-                last_report: self.last_report.clone(),
+                last_report,
                 total_steps: 0,
                 scheduler_passes: 0,
                 yields: 0,
@@ -9874,6 +9995,7 @@ impl RuntimeEngine {
         }
         self.api.sync_display_tree_from_runtime();
         self.api.refresh_aux_masked_sprites();
+        self.api.refresh_linked_sprite_masks();
         self.api.refresh_native_sprite_filters();
         self.api.refresh_native_filters();
         self.api.sweep_unreferenced_archive_images();
@@ -10392,6 +10514,19 @@ mod input_tests {
             raw: Vec::new().into(),
             warning: None,
         }
+    }
+
+    #[test]
+    fn unknown_native_host_calls_fail_without_acknowledgement() {
+        use ethornell_vm::{NativeCallFrame, NativeOpcode, VmError};
+        let manager = ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let mut call = NativeCallFrame::new(NativeOpcode { group:0x80,id:u16::MAX },vec![]);
+        assert!(matches!(ethornell_vm::SysApi::call_sys(&mut api,&mut call),Err(VmError::UnknownDispatch { group:0x80,id:u16::MAX })));
+        let mut call = NativeCallFrame::new(NativeOpcode { group:0x91,id:u16::MAX },vec![]);
+        assert!(matches!(ethornell_vm::GraphApi::call_graph(&mut api,&mut call),Err(VmError::UnknownDispatch { group:0x91,id:u16::MAX })));
+        let mut call = NativeCallFrame::new(NativeOpcode { group:0xa0,id:u16::MAX },vec![]);
+        assert!(matches!(ethornell_vm::SoundApi::call_sound(&mut api,&mut call),Err(VmError::UnknownDispatch { group:0xa0,id:u16::MAX })));
     }
 
     #[test]
@@ -12758,6 +12893,23 @@ mod input_tests {
 
         let captured = &api.graph_images["runtime:priority-bitmap:128"];
         assert_eq!(&captured.rgba[..4], &[200, 100, 50, 255]);
+
+        // Newer Graph91:05 draws into an existing destination, keeping its
+        // dimensions and resource identity, rather than creating screen size.
+        api.recreate_native_bitmap(129, 2, 1, 1);
+        let mut capture = [129, 0, 0, 71].map(Value::Int).to_vec();
+        assert_eq!(call_graph(&mut api, 0x91, 0x05, &mut capture).unwrap(), Value::Int(0));
+        let captured = api.graph_bitmap_image(129).unwrap();
+        assert_eq!((captured.width, captured.height), (2, 1));
+        assert_eq!(&captured.rgba[..4], &[200, 100, 50, 255]);
+        let mut outside = [129, -1, 0, 71].map(Value::Int).to_vec();
+        call_graph(&mut api, 0x91, 0x05, &mut outside).unwrap();
+        assert_eq!(&api.graph_bitmap_image(129).unwrap().rgba[..4], &[0, 0, 0, 255]);
+        let mut missing = [130, 0, 0, 71].map(Value::Int).to_vec();
+        assert_eq!(call_graph(&mut api, 0x91, 0x05, &mut missing).unwrap(), Value::Int(2));
+        api.recreate_native_bitmap(130, 1, 1, 2);
+        let mut incompatible = [130, 0, 0, 71].map(Value::Int).to_vec();
+        assert_eq!(call_graph(&mut api, 0x91, 0x05, &mut incompatible).unwrap(), Value::Int(1));
     }
 
     #[test]
@@ -19967,6 +20119,33 @@ mod input_tests {
             [0; 3],
             "base DCIPIcon must not synthesize DCIPIconEx 0x10000006/07 events"
         );
+
+        // The activated button may replace its processor before the host
+        // delivers UP. Per-tick consumption must not lose gesture ownership.
+        api.finish_native_tick_input();
+        api.graph_input_objects.remove(&77);
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MouseRelease { x: 21.0, y: 31.0 },
+        );
+        assert!(api.pending_input_consumed);
+        assert_eq!(api.pending_click, None);
+        assert!(!api.mouse_pressed);
+        assert!(!api.input_physically_held.contains(&super::INPUT_DESCRIPTOR_MOUSE_LEFT));
+        assert!(!api.input_down_descriptors.contains(&super::INPUT_DESCRIPTOR_MOUSE_LEFT));
+        assert_eq!(SysApi::read_input_state(&mut api, super::INPUT_DESCRIPTOR_MOUSE_LEFT), 0);
+
+        api.finish_native_tick_input();
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MousePress { x: 200.0, y: 200.0 },
+        );
+        super::apply_runtime_input_event(
+            &mut api,
+            super::RuntimeInputEvent::MouseRelease { x: 200.0, y: 200.0 },
+        );
+        assert!(!api.pending_input_consumed);
+        assert_eq!(api.pending_click, Some((200.0, 200.0)));
     }
 
     #[test]
@@ -20723,6 +20902,7 @@ fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent
             api.pending_input_state = Some(0x1000_0002);
             api.pending_input_descriptor = Some(INPUT_DESCRIPTOR_MOUSE_LEFT);
             api.pending_input_consumed = false;
+            api.graph_icon_press_consumed = false;
             // WM_LBUTTONDOWN: a Knob under the pointer (sub_463CE0) captures
             // the press and only the activation accumulator moves
             // (sub_46E080); otherwise the record takes the press
@@ -20739,6 +20919,7 @@ fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent
             } {
                 // DCIPIcon participates in the same native input-descriptor
                 // drain as CProcDspMsg. Preserve that one-owner consumption.
+                api.graph_icon_press_consumed = true;
                 api.pending_input_consumed = true;
             }
             push_runtime_window_message(api, 0x0201, pack_window_message_point(x, y), 1);
@@ -20754,17 +20935,21 @@ fn apply_runtime_input_event(api: &mut RuntimeTraceApi, event: RuntimeInputEvent
             let point = Some((x, y));
             api.mouse_pos = point;
             api.mouse_pressed = false;
+            let icon_press_consumed = std::mem::take(&mut api.graph_icon_press_consumed);
             let knob_consumed = api.process_graph_knob_mouse_release((x, y));
             let graph_input_consumed = if knob_consumed {
                 true
             } else {
                 api.process_graph_input_mouse_release((x, y))
             };
+            // Run deferred icon release handling before combining ownership:
+            // an immediately activated icon may already have closed its UI.
+            let graph_input_consumed = graph_input_consumed || icon_press_consumed;
             api.pending_click = if graph_input_consumed { None } else { point };
             api.pending_click_age_frames = 0;
             api.pending_input_state = Some(0x1000_0006);
             api.pending_input_descriptor = Some(INPUT_DESCRIPTOR_MOUSE_LEFT);
-            // A captured Knob or release-triggered DCIPIconEx item consumes the
+            // A captured Knob or press/release-triggered icon consumes the
             // complete physical gesture. Do not expose it to CProcDspMsg as a
             // second "advance text" action.
             api.pending_input_consumed = graph_input_consumed;
@@ -22260,6 +22445,12 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             && find_runtime_resource(&self.manager, archive, entry).is_some()
     }
 
+    fn archive_entry_names(&mut self, archive: &str) -> Option<Vec<String>> {
+        let names = user_files::archive_directory_names(&self.manager, &self.native_root, archive);
+        tracing::debug!(archive, count = ?names.as_ref().map(Vec::len), "EnumerateArchiveDirectory");
+        names
+    }
+
     fn media_prompt(&mut self, title: &str, text: &str) -> bool {
         let retry = retry_or_quit_prompt(title, text);
         if !retry {
@@ -22447,6 +22638,43 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         self.disk_file_exists(path) || self.directory_exists(path)
     }
 
+    fn user_ui_language(&mut self) -> i32 {
+        use ethornell_archive::ArchiveLanguage;
+        if let Some(language) = self.manager.archive_language() {
+            return match language {
+                ArchiveLanguage::Japanese => 0x0411,
+                ArchiveLanguage::English => 0x0409,
+                ArchiveLanguage::SimplifiedChinese => 0x0804,
+                ArchiveLanguage::TraditionalChinese => 0x0404,
+                ArchiveLanguage::Korean => 0x0412,
+            };
+        }
+        let locale = std::env::var("LC_ALL").or_else(|_| std::env::var("LC_MESSAGES"))
+            .or_else(|_| std::env::var("LANG")).unwrap_or_default().to_ascii_lowercase();
+        if locale.starts_with("ja") { 0x0411 }
+        else if locale.starts_with("zh_tw") || locale.starts_with("zh_hk") { 0x0404 }
+        else if locale.starts_with("zh") { 0x0804 }
+        else if locale.starts_with("ko") { 0x0412 }
+        else { 0x0409 }
+    }
+
+    fn register_installation(&mut self, company: &str, product: &str, folder: &str) -> ethornell_vm::VmResult<()> {
+        // BP 0x73 / FD sub_486710: a persistent company/product folder record.
+        // Keep this in the host-owned user capability instead of HKLM.
+        const PATH: &str = "bgi-user/installations.json";
+        let mut records: BTreeMap<String, String> = match self.read_user_file_bytes(PATH) {
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(|error| ethornell_vm::VmError::Runtime(format!("installation metadata: {error}")))?,
+            None => BTreeMap::new(),
+        };
+        let key = serde_json::to_string(&(company, product)).expect("strings serialize");
+        records.insert(key, format!("\"{folder}\""));
+        let bytes = serde_json::to_vec(&records).expect("string records serialize");
+        if !self.write_file_bytes(PATH, &bytes) {
+            return Err(ethornell_vm::VmError::Runtime("cannot persist installation metadata".into()));
+        }
+        Ok(())
+    }
+
     fn message_box(&mut self, caption: &str, text: &str) {
         // An empty caption is sub_46BC80's default (sub_46C1E0 with no
         // caption), as for script errors.
@@ -22455,6 +22683,10 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
         } else {
             caption.to_string()
         };
+        if !self.native_dialog_presentation {
+            tracing::warn!(caption, message = text, "native message (offscreen; dialog suppressed)");
+            return;
+        }
         host_dialog::show_message(
             host_dialog::MessageDialogKind::Information,
             &caption,
@@ -22556,7 +22788,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
     ) -> Vec<String> {
         if let Some(policy) = file_policy::active() {
             return policy
-                .enumerate_user(pattern, recursive, max_count, false)
+                .enumerate_user(&user_files::native_enumeration_pattern(pattern), recursive, max_count, false)
                 .unwrap_or_default();
         }
         let normalized = pattern.replace('\\', "/");
@@ -22684,13 +22916,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
     /// spanned dual monitor) against the display mode's size, both as
     /// (int)(10000.0 * w / h) in double precision.
     fn display_aspect_mismatch(&mut self) -> bool {
-        let (mut width, mut height) = match self.desktop_display_size {
-            (0, _) | (_, 0) => (
-                self.window_surface_width.max(0) as u32,
-                self.window_surface_height.max(0) as u32,
-            ),
-            size => size,
-        };
+        let (mut width, mut height) = self.available_display_size();
         let (mode_width, mode_height) = self.display_mode_size();
         if width == 0 || height == 0 || mode_width <= 0 || mode_height <= 0 {
             return false;
@@ -22771,7 +22997,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
     }
 
     fn desktop_display_size(&mut self) -> (u32, u32) {
-        self.desktop_display_size
+        self.available_display_size()
     }
 
     fn fullscreen_scale_mode(&mut self) -> i32 {
@@ -24154,15 +24380,9 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             }
             (0x80, 0x2a) => {
                 let path = pop_string_value(stack).unwrap_or_else(|| "<unknown>".into());
-                if let Some(policy) = file_policy::active() {
-                    // Like Sys80:28, a root UserData name means the user tree.
-                    return Ok(ethornell_vm::Value::Int(i32::from(
-                        policy.user_metadata(&path).is_some_and(|m| m.is_dir()),
-                    )));
-                }
-                let exists = runtime_file_path_from_root(&self.manager, &self.native_root, &path)
-                    .map(|path| path.is_dir())
-                    .unwrap_or(false);
+                // Match validated user-root checks (80:68) and directory
+                // creation: resource/UserData is a private storage alias.
+                let exists = ethornell_vm::SysApi::directory_exists(self, &path);
                 tracing::info!(path, exists, "DirectoryExists");
                 return Ok(ethornell_vm::Value::Int(i32::from(exists)));
             }
@@ -24631,7 +24851,7 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             stack_top = ?stack_top_summary(stack, 8),
             "runtime syscall stub"
         );
-        Ok(ethornell_vm::Value::None)
+        Err(ethornell_vm::VmError::UnknownDispatch { group, id })
     }
 }
 
@@ -24997,6 +25217,25 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
         }
         let (x, y) = self.graph_native_composite_position(object)?;
         Some([x, y])
+    }
+
+    fn register_named_font_transform(&mut self, name: &str, values: [i32; 5]) -> ethornell_vm::VmResult<()> {
+        self.register_native_named_font_transform(name, values)
+    }
+    fn set_named_font_tracking(&mut self, name: &str, tracking: i32) -> ethornell_vm::VmResult<()> {
+        if !(-65536..=65536).contains(&tracking) {
+            return Err(ethornell_vm::VmError::Runtime(format!("無効な値 [ {} ] が指定されました", tracking as f32 / 65536.0)));
+        }
+        let transform = self.graph91_font_transforms.get_mut(&name.to_ascii_lowercase())
+            .ok_or_else(|| ethornell_vm::VmError::Runtime(format!("未登録のフォント名 [ {name} ] が指定されました")))?;
+        transform.tracking = tracking;
+        Ok(())
+    }
+
+    fn window_last_text_extent(&self, window: i32) -> Option<i32> {
+        if self.display_tree.kind(window) != Some(crate::display_tree::NativeDisplayKind::Window) { return None; }
+        self.graph_surfaces.get(&window)?;
+        Some(self.surface_text_states.get(&window).map_or(0, |state| state.last_text_extent))
     }
 
     fn native_font_registered(&self, font: i32) -> bool {
@@ -26703,8 +26942,14 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                             rgba,
                         },
                     );
-                    self.graph_resources
-                        .insert(bitmap_id, RuntimeGraphResource::whole(key));
+                    // Clear/fill mutates the existing bitmap, unlike 90:11.
+                    // Keep its generation so live sprite bindings remain valid.
+                    if let Some(binding) = self.graph_resources.get_mut(&bitmap_id) {
+                        binding.key = key;
+                        binding.source_rect = None;
+                    } else {
+                        self.graph_resources.insert(bitmap_id, RuntimeGraphResource::whole(key));
+                    }
                     if let Some(surface) = self.graph_surfaces.get_mut(&bitmap_id) {
                         surface.resource_id = Some(bitmap_id);
                     }
@@ -28278,6 +28523,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                             kinsoku,
                             color,
                             shadow,
+                            font,
                         )
                         .unwrap_or((1, (x, y))),
                     None => (1, (x, y)),
@@ -28750,6 +28996,7 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                     stack_top = ?stack_top_summary(stack, 8),
                     "runtime graphcall stub"
                 );
+                return Err(ethornell_vm::VmError::UnknownDispatch { group, id });
             }
         }
         Ok(ethornell_vm::Value::None)
@@ -29362,7 +29609,7 @@ impl ethornell_vm::SoundApi for RuntimeTraceApi {
             stack_top = ?stack_top_summary(stack, 8),
             "runtime sndcall stub"
         );
-        Ok(ethornell_vm::Value::None)
+        Err(ethornell_vm::VmError::UnknownDispatch { group, id })
     }
 }
 
@@ -29826,7 +30073,7 @@ fn windows_wildcard_matches(pattern: &str, value: &str) -> bool {
 fn runtime_file_attributes(manager: &ResourceManager, file: &str) -> i32 {
     if let Some(policy) = file_policy::active() {
         return policy
-            .metadata(file)
+            .user_metadata(file)
             .map(|m| (if m.readonly() { 1 } else { 0 }) | if m.is_dir() { 0x10 } else { 0x20 })
             .unwrap_or(-1);
     }
