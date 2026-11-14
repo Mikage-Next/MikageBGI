@@ -902,24 +902,49 @@ fn build_resource_lookup(
     let mut archive_by_name = HashMap::with_capacity(set.archives.len());
     let mut archive_by_path = HashMap::with_capacity(set.archives.len());
 
-    for (archive_index, archive) in set.archives.iter().enumerate() {
-        archive_by_path
-            .entry(archive.path.clone())
-            .or_insert(archive_index);
-        if let Some(name) = archive.path.file_name().and_then(|name| name.to_str()) {
-            archive_by_name
-                .entry(archive_name_key(name))
+    // Chinese fan patches ship `name.chs` archives (BURIKO ARC20 payloads under
+    // a `.chs` extension) that the patched BGI executable loads in place of the
+    // Japanese `name.arc`. Register such an override before the archives it
+    // replaces (pass 0) so its entries win bare-name resolution and so the
+    // `.arc` archive name resolves to it, while the base `.arc` stays loaded as
+    // a lower-priority fallback. With no `.chs` archive present pass 0 is empty
+    // and the result is identical to a single ordered pass.
+    for override_pass in [true, false] {
+        for (archive_index, archive) in set.archives.iter().enumerate() {
+            let name = archive.path.file_name().and_then(|name| name.to_str());
+            let override_arc = name.and_then(chs_override_arc_key);
+            if override_arc.is_some() != override_pass {
+                continue;
+            }
+            archive_by_path
+                .entry(archive.path.clone())
                 .or_insert(archive_index);
-        }
-        for (entry_index, entry) in archive.entries.iter().enumerate() {
-            by_name
-                .entry(normalize_resource_name(&entry.name))
-                .or_default()
-                .push((archive_index, entry_index));
+            if let Some(name) = name {
+                archive_by_name
+                    .entry(archive_name_key(name))
+                    .or_insert(archive_index);
+                if let Some(arc_key) = override_arc {
+                    archive_by_name.entry(arc_key).or_insert(archive_index);
+                }
+            }
+            for (entry_index, entry) in archive.entries.iter().enumerate() {
+                by_name
+                    .entry(normalize_resource_name(&entry.name))
+                    .or_default()
+                    .push((archive_index, entry_index));
+            }
         }
     }
 
     (by_name, archive_by_name, archive_by_path)
+}
+
+/// The `.arc` archive-name key a `.chs` override archive stands in for, or
+/// `None` when `name` is not a `.chs` archive. `data02099.chs` -> `data02099.arc`.
+fn chs_override_arc_key(name: &str) -> Option<String> {
+    archive_name_key(name)
+        .strip_suffix(".chs")
+        .map(|stem| format!("{stem}.arc"))
 }
 
 fn archive_name_key(name: &str) -> String {
@@ -2332,6 +2357,30 @@ mod tests {
         assert!(manager.find_in_archive("data02xxx.arc", "face").is_some());
         assert!(manager.first_in_archive("Archive\\data01000.arc").is_some());
         assert!(manager.first_in_archive("data02xxx.arc").is_some());
+    }
+
+    #[test]
+    fn chs_override_archive_stands_in_for_its_arc_namesake() {
+        // A Chinese fan patch drops `system.chs` next to the Japanese
+        // `system.arc`. The patched executable loads the `.chs` in its place, so
+        // our lookup must resolve the `system.arc` archive name and the shared
+        // resource to the override even though it sorts after the base archive.
+        let manager = manager_over(&[
+            ("system.arc", &["ipl._bp"]),
+            ("system.chs", &["ipl._bp"]),
+        ]);
+
+        let ipl = manager.find_in_archive("system.arc", "ipl._bp").unwrap();
+        assert_eq!(ipl.archive_path, PathBuf::from("game/system.chs"));
+        assert_eq!(
+            manager.first_in_archive("system.arc").unwrap().archive_path,
+            PathBuf::from("game/system.chs")
+        );
+        // The override is also reachable under its own `.chs` name.
+        assert_eq!(
+            manager.find_in_archive("system.chs", "ipl._bp").unwrap().archive_path,
+            PathBuf::from("game/system.chs")
+        );
     }
 
     #[test]

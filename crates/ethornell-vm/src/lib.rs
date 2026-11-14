@@ -8639,6 +8639,26 @@ impl Vm {
         if self.native_utf8_enabled() {
             if let Ok(text)=std::str::from_utf8(&bytes) {return Ok(text.to_owned());}
         }
+        // Some Chinese fan patches (e.g. 绿茶填坑小队's サクラノ詩) ship their
+        // scenario text as UTF-8 and run the game under CP_UTF8, keeping the
+        // Japanese original alongside it in the script. The host configures
+        // such a patch as GBK (its UI archives and font are GBK), but the
+        // displayed strings are UTF-8. Prefer a valid non-ASCII UTF-8 decode
+        // over GBK so those lines are not reinterpreted as mojibake; genuine
+        // GBK text is almost never valid multi-byte UTF-8, so it falls through.
+        if encoding == encoding_rs::GBK {
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                // Require a real CJK character in the UTF-8 reading, not just
+                // any non-ASCII byte: a two-byte GBK sequence can also be valid
+                // UTF-8 for an unrelated Latin/Cyrillic character, and that must
+                // still decode through GBK. Genuine UTF-8 scenario text carries
+                // CJK ideographs, kana or fullwidth punctuation that a
+                // GBK-as-UTF-8 misread does not produce.
+                if text.bytes().any(|byte| byte >= 0x80) && text.chars().any(is_cjk_text_char) {
+                    return Ok(text.to_owned());
+                }
+            }
+        }
         let bytes = if encoding == encoding_rs::SHIFT_JIS {
             engine_shift_jis_bytes(&bytes)
         } else {
@@ -13088,6 +13108,21 @@ fn target_file_enumeration_order(found: &[String], recursive: bool, max_count: u
     out
 }
 
+/// Whether `ch` is a CJK ideograph, kana, or CJK/fullwidth punctuation — the
+/// characters a genuine UTF-8 CJK string carries, used to tell real UTF-8
+/// scenario text apart from a two-byte GBK sequence that merely happens to be
+/// valid UTF-8 for a Latin or Cyrillic character.
+fn is_cjk_text_char(ch: char) -> bool {
+    matches!(ch as u32,
+        0x3000..=0x303F   // CJK symbols and punctuation
+        | 0x3040..=0x30FF // Hiragana + Katakana
+        | 0x3400..=0x4DBF // CJK Extension A
+        | 0x4E00..=0x9FFF // CJK Unified Ideographs
+        | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+        | 0xFF00..=0xFFEF // Halfwidth and Fullwidth Forms
+        | 0x20000..=0x2FA1F) // CJK Extensions B+ / Compatibility Supplement
+}
+
 fn engine_shift_jis_bytes(bytes: &[u8]) -> Cow<'_, [u8]> {
     let mut output: Option<Vec<u8>> = None;
     let mut index = 0;
@@ -16941,6 +16976,25 @@ mod tests {
             vm.calls
                 .keys()
                 .any(|key| key.starts_with("script:0xFF:0x40:"))
+        );
+    }
+
+    #[test]
+    fn graph_text_prefers_utf8_chinese_over_gbk_for_patched_scenarios() {
+        // 绿茶填坑小队's サクラノ詩 patch stores its scenario text as UTF-8 and
+        // runs under CP_UTF8, while the host still configures the game as GBK.
+        // A UTF-8 CJK string must decode as UTF-8, not be reinterpreted as GBK.
+        let mut vm = Vm::new();
+        vm.set_graph_text_encoding(encoding_rs::GBK);
+        let pointer = vm.alloc_heap(64) + 7;
+        let utf8 = "我仰望着漫天飞舞的樱花。".as_bytes();
+        let start = vm.memory_addr(pointer) as usize;
+        vm.memory.resize(vm.memory.len().max(start + utf8.len() + 1), 0);
+        vm.memory[start..start + utf8.len()].copy_from_slice(utf8);
+        vm.memory[start + utf8.len()] = 0;
+        assert_eq!(
+            vm.read_c_string_with_encoding(pointer, encoding_rs::GBK).unwrap(),
+            "我仰望着漫天飞舞的樱花。"
         );
     }
 
