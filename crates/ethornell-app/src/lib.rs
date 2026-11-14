@@ -275,6 +275,19 @@ fn confirmed_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> Nati
                 ..NativeRuntimeProfile::default()
             },
         )),
+        // The same FD engine with Simplified-Chinese archives: its patched
+        // system.chs/sysprg.chs carry a different ipl._bp/title._bp, but the
+        // executable and its sub_4A6C30 (SE 0..128) are unchanged.
+        (11952, 0x912bc91f71821a65) => Some((
+            18640,
+            0x3c2bae81495cf990,
+            NativeRuntimeProfile {
+                se_channels: 128,
+                main_code_bytes: 0x800000,
+                main_data_bytes: 0x400000,
+                ..NativeRuntimeProfile::default()
+            },
+        )),
         _ => None,
     };
     if let Some((title_len, title_hash, profile)) = expected_title {
