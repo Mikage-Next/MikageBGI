@@ -169,20 +169,20 @@ impl PatchPackage {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // A zstd frame for `PAYLOAD`, produced by a reference zstd encoder; ruzstd
     // is decode-only, so the fixture is embedded rather than compressed here.
-    const PAYLOAD: &[u8] = b"BurikoCompiledScriptVer1.00 patched hello";
-    const ZSTD_FRAME: &[u8] = &[
+    pub(crate) const PAYLOAD: &[u8] = b"BurikoCompiledScriptVer1.00 patched hello";
+    pub(crate) const ZSTD_FRAME: &[u8] = &[
         0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x29, 0x49, 0x01, 0x00, 0x42, 0x75, 0x72, 0x69, 0x6b, 0x6f,
         0x43, 0x6f, 0x6d, 0x70, 0x69, 0x6c, 0x65, 0x64, 0x53, 0x63, 0x72, 0x69, 0x70, 0x74, 0x56,
         0x65, 0x72, 0x31, 0x2e, 0x30, 0x30, 0x20, 0x70, 0x61, 0x74, 0x63, 0x68, 0x65, 0x64, 0x20,
         0x68, 0x65, 0x6c, 0x6c, 0x6f,
     ];
 
-    fn build_package(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(crate) fn build_package(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(PAKZ_MAGIC);
         out.extend_from_slice(&(entries.len() as u32).to_le_bytes());

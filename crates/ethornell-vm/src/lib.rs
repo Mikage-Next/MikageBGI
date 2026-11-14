@@ -2045,7 +2045,11 @@ pub trait SoundApi {
     /// B0:C5: GDI charset-filtered enumeration. Portable hosts may expose
     /// their substituted stock CJK faces for DEFAULT/SHIFTJIS charsets only.
     fn user_font_families_for_charset(&self, charset: u8) -> Vec<String> {
-        if matches!(charset, 1|128) { self.user_font_families() } else { Vec::new() }
+        // The stock Japanese faces also carry ANSI_CHARSET, so Windows lists
+        // them for charset 0 too. NSM_MYST's ipl._bp enumerates 128 then 0
+        // and frees each result buffer; an empty ANSI list leaves the
+        // previous (already freed) pointer behind and double-frees it.
+        if matches!(charset, 0|1|128) { self.user_font_families() } else { Vec::new() }
     }
 
 
@@ -10195,9 +10199,11 @@ impl Vm {
                 Value::Int(1)
             }
             (0x81, 0x21) => {
-                if self.native_abi_profile!=NativeAbiProfile::Amachoco {return Ok(None);}
+                if !matches!(self.native_abi_profile, NativeAbiProfile::Amachoco | NativeAbiProfile::ModernFused) {return Ok(None);}
                 // amachoco.exe's sub_4953A0 pops source then destination and
-                // converts the source from CP932 to UTF-8. Retain the decoded
+                // converts the source from CP932 to UTF-8. NSM_MYST.exe's
+                // 1400EB8B0 is the same: two pointer pops, then 1400F6B10
+                // (MultiByteToWideChar 932 -> WideCharToMultiByte 65001). Retain the decoded
                 // string as a shadow value so later BP copies and graph calls
                 // do not lose it by treating the pointer as an integer.
                 let source = self.pop_value()?;
@@ -18244,6 +18250,51 @@ mod tests {
             vm.mem_values.get(&vm.value_key(destination)),
             Some(&Value::Str("シナリオの台詞".into()))
         );
+    }
+
+    #[test]
+    fn system81_utf8_copy_runs_for_modern_fused_builds() {
+        // NSM_MYST.exe 1400EB8B0 pops source then destination and calls
+        // 1400F6B10 (CP932 -> UTF-8), like amachoco's sub_4953A0.
+        let source = 0x3000;
+        let destination = 0x3100;
+        let mut vm = Vm::new();
+        vm.set_native_abi_profile(super::NativeAbiProfile::ModernFused);
+        vm.mem_values
+            .insert(vm.value_key(source), Value::Str("待宵".into()));
+        vm.stack
+            .extend([Value::Ptr(destination), Value::Ptr(source)]);
+
+        assert_eq!(
+            vm.try_builtin_sys_with_api(&mut TraceApi, 0x81, 0x21)
+                .unwrap(),
+            Some(Value::None)
+        );
+        assert!(vm.stack.is_empty());
+        assert_eq!(vm.read_c_string_bytes(destination).unwrap(), "待宵".as_bytes());
+    }
+
+    #[test]
+    fn modern_fused_font_enumeration_pushes_ansi_byte_count() {
+        // NSM_MYST ipl._bp enumerates charset 128 then 0 with B0:C5 and
+        // frees each result; 1400D3830 pushes the result of 14006B180.
+        let mut vm = Vm::new();
+        vm.set_native_abi_profile(super::NativeAbiProfile::ModernFused);
+        let mut api = SchedulingApi {
+            font_families: vec!["ＭＳ ゴシック".into(), "ＭＳ 明朝".into()],
+            ..SchedulingApi::default()
+        };
+        let enumerate = test_instruction(0x10, 0xb0, "usr1", vec![0xb0, 0xc5], Vec::new());
+        let expected: usize = api
+            .font_families
+            .iter()
+            .map(|name| encoding_rs::SHIFT_JIS.encode(name).0.len() + 1)
+            .sum();
+
+        vm.stack.extend([Value::Int(12345), Value::Int(0), Value::Int(0)]);
+        vm.dispatch(&enumerate, &mut api).unwrap();
+        assert_eq!(vm.stack, [Value::Int(12345), Value::Int(expected as i32)]);
+        assert!(api.user_font_families_for_charset(134).is_empty());
     }
 
     #[test]

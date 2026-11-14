@@ -22663,9 +22663,17 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
             // Return packed bytes from an indexed descriptor, including for
             // composite members named Archive\\data01000.arc.
             let found = user_files::indexed_archive_entry(&self.manager, archive, entry)?;
+            if let Some(patched) = self.manager.patch_decoded(&found.entry_name) {
+                return patched.ok();
+            }
             return self.manager.read_by_entry_raw(&found).ok();
         }
         let found = find_runtime_resource(&self.manager, archive, entry)?;
+        // A BGIPatch replacement is already decoded; the VM's DSC/CBG decode
+        // passes plain bytes through.
+        if let Some(patched) = self.manager.patch_decoded(&found.entry_name) {
+            return patched.ok();
+        }
         self.manager.read_by_entry_raw(&found).ok()
     }
 

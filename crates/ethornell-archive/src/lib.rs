@@ -386,7 +386,11 @@ impl ResourceManager {
     }
 
     /// The patched, decoded bytes for a resource the BGIPatch package overrides.
-    fn patch_decoded(&self, name: &str) -> Option<Result<Vec<u8>>> {
+    ///
+    /// Hosts that hand packed archive bytes to the VM (which then decodes DSC
+    /// and CBG itself) use this to substitute the replacement; the VM passes
+    /// already-decoded bytes through unchanged.
+    pub fn patch_decoded(&self, name: &str) -> Option<Result<Vec<u8>>> {
         self.inner.patch_package.as_ref()?.read_decoded(name)
     }
 
@@ -657,6 +661,11 @@ impl ResourceManager {
     }
 
     pub fn read_by_entry_decoded(&self, entry: &ResourceEntry) -> Result<Vec<u8>> {
+        // Entry-based reads (the runtime's scenario loader resolves an entry
+        // first, then reads it) must see BGIPatch replacements too.
+        if let Some(bytes) = self.patch_decoded(&entry.entry_name) {
+            return bytes;
+        }
         let raw = self.read_by_entry_bytes(entry, true)?;
         decode_payload_owned(&entry.entry_name, raw, &self.inner.limits)
     }
@@ -2186,6 +2195,21 @@ mod tests {
                 .unwrap(),
             b"ABA"
         );
+    }
+
+    #[test]
+    fn patch_package_overrides_entry_reads() {
+        use crate::patch_package::tests::{PAYLOAD, ZSTD_FRAME, build_package};
+        let fixture = TestArchive::new(&archive_bytes(ArchiveFormat::PackFile, b"hello"));
+        let mut manager = fixture.manager(ResourceBudget::default());
+        assert!(manager.set_patch_package(build_package(&[("ipl._bp", ZSTD_FRAME)])).unwrap());
+        let entry = manager.list().into_iter().next().unwrap();
+        // Entry-based decoded reads and the patched-bytes lookup the VM's
+        // packed-read path uses both see the replacement; raw archive bytes
+        // stay the original.
+        assert_eq!(manager.read_by_entry_decoded(&entry).unwrap(), PAYLOAD);
+        assert_eq!(manager.patch_decoded(&entry.entry_name).unwrap().unwrap(), PAYLOAD);
+        assert_eq!(manager.read_by_entry_raw(&entry).unwrap(), b"hello");
     }
 
     #[test]
