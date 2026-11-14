@@ -192,6 +192,7 @@ pub struct HostRuntime {
     _writer_lock: file_policy::WriterLock,
     renderer: Option<Renderer<'static>>,
     textures: BTreeMap<String, CachedGraphTexture>,
+    presenter: frame_presenter::GpuPresenter,
     font: FontArc,
     audio: Option<AudioSystem>,
     backend: u32,
@@ -367,6 +368,7 @@ impl HostRuntime {
             _writer_lock: writer_lock,
             renderer: None,
             textures: BTreeMap::new(),
+            presenter: frame_presenter::GpuPresenter::default(),
             font,
             audio,
             backend: config.backend,
@@ -582,6 +584,7 @@ impl HostRuntime {
             Ok(())
         })?;
         self.generation = generation;
+        self.presenter = frame_presenter::GpuPresenter::default();
         Ok(())
     }
     pub fn detach_surface(&mut self, generation: u64) -> Result<()> {
@@ -862,14 +865,15 @@ impl HostRuntime {
             self.runtime.api.screen_width.max(1) as f32,
             self.runtime.api.screen_height.max(1) as f32,
         );
-        // sub_462100: present a newly composed frame only when one is due.
-        if self.runtime.api.take_present_due() {
-            self.runtime.api.performance_profile.begin();
-            let commands =
-                frame_presenter::prepare_frame(renderer, &self.runtime.api, &mut self.textures)?;
+        self.runtime.api.performance_profile.begin();
+        let commands = frame_presenter::prepare_frame(
+            renderer, &mut self.runtime.api, &mut self.textures, &mut self.presenter,
+        )?;
+        let changed = commands.is_some();
+        if let Some(commands) = commands {
             renderer.submit(&commands);
-            self.runtime.api.performance_profile.end(true);
         }
+        self.runtime.api.performance_profile.end(changed);
         renderer.render()?;
         self.runtime.api.presentation_state =
             self.runtime
@@ -1018,8 +1022,8 @@ impl RuntimeEngine {
         strict: bool,
         encoding: &'static encoding_rs::Encoding,
     ) -> Self {
-        let program = ethornell_script::parse_bp_program(Some(script.into()), bytes);
         let profile = confirmed_native_profile(&manager, bytes);
+        let program = ethornell_script::parse_bp_program_profile(Some(script.into()),bytes,profile.abi);
         let mut vm = ethornell_vm::Vm::with_main_thread_regions(
             profile.main_code_bytes,
             profile.main_data_bytes,
@@ -1035,6 +1039,8 @@ impl RuntimeEngine {
                 let mut api = RuntimeTraceApi::new_with_native_root(manager, root);
                 api.configure_for_dialect(program.dialect);
                 api.configure_native_sound_channels(profile.se_channels);
+                api.bp_profile=profile.abi;
+                if let Some(sizes)=profile.display_modes {api.display_mode_sizes=sizes.map(Some);api.display_mode_limit=16;}
                 api.modern_gradient_blur = profile.modern_gradient_blur;
                 api
             },

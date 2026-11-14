@@ -3,8 +3,10 @@ use ethornell_vm::SysApi;
 
 #[derive(Default)]
 pub(super) struct NativeSystemState {
-    #[cfg(any(target_os = "vita", target_os = "horizon"))]
-    pub(super) mutex_names: BTreeMap<String, u64>,
+    /// 1.653 544A98 / 1.687 1401ECF30: 600 main-loop wall-clock deltas.
+    pub(super) frame_history: VecDeque<i32>,
+    #[cfg(any(target_os="vita",target_os="horizon"))]
+    pub(super) mutex_names: BTreeMap<String,u64>,
     pub(super) main_loop_wait_override: i32,
     pub(super) drag_drop_enabled: bool,
     pub(super) fullscreen_hotkeys_enabled: bool,
