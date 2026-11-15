@@ -107,6 +107,12 @@ pub fn lookup_profile(profile: NativeAbiProfile, group:u8, id:u16)->Option<Nativ
             (0x91,0xf9) | (0x91,0xfa) => (0,1,false),
             (0x91,0xfb) => (1,1,false),
             (0x92,0x94) => (2,1,false),
+            // Measured under Wine on NSM_MYST.exe (BP stack pointer before
+            // and after each call). 1400E8530 pops nothing and pushes the
+            // result of 140088580; 1400D8190 pops three values and pushes a
+            // status.
+            (0x80,0x41) => (0,1,false),
+            (0x90,0x9a) => (3,1,false),
             _ => (0,0,false),
         };
         if argc != 0 || outputs != 0 || procedure {
@@ -462,6 +468,13 @@ mod tests {
         // 695 handler pointers in the eight dispatch tables; 0x81:0x21 and
         // 0x81:0xDA have descriptors but null handlers.
         assert_eq!(count, 695);
+    }
+
+    #[test]
+    fn modern_fused_stack_effects_measured_on_nsm_myst() {
+        let lookup = |g, i| lookup_profile(NativeAbiProfile::ModernFused, g, i).unwrap();
+        assert_eq!((lookup(0x80, 0x41).argc, lookup(0x80, 0x41).stack_outputs), (0, 1));
+        assert_eq!((lookup(0x90, 0x9a).argc, lookup(0x90, 0x9a).stack_outputs), (3, 1));
     }
 
     #[test]

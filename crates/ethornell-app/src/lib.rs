@@ -29128,6 +29128,9 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 let mode = pop_int_value(stack).unwrap_or_default();
                 self.graph_defaults.configure_caret_position(mode, x, y);
                 tracing::info!(mode, x, y, "GraphSetCaretPosition");
+                // NSM_MYST 1400D8190 pushes a status (0 = success); the
+                // output contract discards it for profiles without one.
+                return Ok(ethornell_vm::Value::Int(0));
             }
             (0x90, 0x9d) => {
                 let alpha = pop_int_value(stack).unwrap_or_default();
