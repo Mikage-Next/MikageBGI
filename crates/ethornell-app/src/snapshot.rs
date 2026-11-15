@@ -520,6 +520,7 @@ pub(crate) fn compose_graph_object(
     let mut out = new_raster(width.max(1), height.max(1))?;
 
     if let Some(surface) = surface
+        && surface.back_enabled
         && let Some(resource_id) = surface.resource_id
         && let Some((key, region)) = api.resource_image_region(resource_id)
         && let Some(source) = api.graph_images.get(key)

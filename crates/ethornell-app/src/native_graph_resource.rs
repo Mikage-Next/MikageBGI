@@ -19,19 +19,28 @@ impl RuntimeTraceApi {
             0x8A => {
                 // sub_486D20 -> sub_440F10 -> sub_42B7B0: fills the window
                 // buffer (sub_40A700) with the value; a window without a
-                // buffer is left alone.
+                // buffer is left alone. NSM_MYST.exe (x64) does the same
+                // through 140082D00 -> 140068D10 on the back bitmap (+0x1B8)
+                // that Graph90:86 and Graph92:89 draw into; its message
+                // window uses it to drop the copy Graph90:86 left at (0, 0).
                 let value = pop_int_value(stack).unwrap_or_default();
                 let object = pop_int_value(stack).unwrap_or_default();
                 if let Err(error) = self.graph92_require_window(object) {
                     return Some(Err(error));
                 }
                 self.clear_bitmap_text(object);
-                self.graph_object_properties
-                    .entry(object)
-                    .or_default()
-                    .properties
-                    .insert(0x8a, (value, 0));
-                tracing::debug!(object, value, "GraphSetTextObjectAuxiliaryValue");
+                // Only a window that has a back bitmap here (bound by
+                // Graph90:86 or drawn into) is filled.
+                let filled = self
+                    .graph_surfaces
+                    .get(&object)
+                    .is_some_and(|surface| surface.resource_id.is_some())
+                    && self.fill_window_back(object, value as u32);
+                tracing::debug!(object, value, filled, "GraphFillWindowBuffer");
+                self.trace_graph(format!(
+                    "window #{object} buffer fill=0x{:08X} filled={filled}",
+                    value as u32
+                ));
                 ethornell_vm::Value::None
             }
             // sub_487150 -> sub_433210: a glyph image for a character code

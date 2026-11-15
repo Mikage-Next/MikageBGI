@@ -7359,6 +7359,33 @@ impl RuntimeTraceApi {
         true
     }
 
+    /// Graph92:8A: fill the window's back bitmap with one colour (ARGB, as
+    /// the 32-bit pixel is stored). Graph92:89 draws into the same bitmap.
+    fn fill_window_back(&mut self, window: i32, color: u32) -> bool {
+        let Some((width, height)) = self.graph_surfaces.get(&window).map(|surface| {
+            (
+                surface.width.max(1.0) as u32,
+                surface.height.max(1.0) as u32,
+            )
+        }) else {
+            return false;
+        };
+        let [b, g, r, a] = color.to_le_bytes();
+        let image = DecodedImage {
+            width,
+            height,
+            rgba: [r, g, b, a].repeat(width as usize * height as usize),
+        };
+        let key = format!("runtime:bitmap:{window}");
+        self.store_graph_image(key.clone(), image);
+        self.graph_resources
+            .insert(window, RuntimeGraphResource::whole(key));
+        if let Some(surface) = self.graph_surfaces.get_mut(&window) {
+            surface.resource_id = Some(window);
+        }
+        true
+    }
+
     fn render_graph_object_to_bitmap(&mut self, object_id: i32, bitmap_id: i32) -> bool {
         let target_size = self.bitmap_dimensions.get(&bitmap_id).copied();
         self.refresh_linked_sprite_masks();
@@ -8931,7 +8958,7 @@ impl RuntimeTraceApi {
             // own) >> 8).
             if Self::is_window_surface_handle(surface.id) {
                 let (enabled, global) = self.graph_config.window_buffer;
-                if enabled == 0 {
+                if enabled == 0 || !surface.back_enabled {
                     continue;
                 }
                 let own = properties.map_or(0, |properties| properties.transparency_parameter());
@@ -13137,6 +13164,70 @@ mod input_tests {
             api.graph_images["runtime:bitmap:1086"].rgba,
             pixel.repeat(4 * 2)
         );
+    }
+
+    #[test]
+    fn graph92_8a_clears_window_back_and_92_88_gates_it() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let mut create = vec![Value::Int(8), Value::Int(4)];
+        let window = match call_graph(&mut api, 0x90, 0x80, &mut create).unwrap() {
+            Value::Int(handle) => handle,
+            value => panic!("unexpected window handle {value:?}"),
+        };
+        let bar = [200, 10, 10, 255];
+        api.store_graph_image(
+            "test:name-bar".to_string(),
+            DecodedImage {
+                width: 4,
+                height: 2,
+                rgba: bar.repeat(4 * 2),
+            },
+        );
+        api.graph_resources
+            .insert(2000, RuntimeGraphResource::whole("test:name-bar".to_string()));
+        api.bitmap_formats.insert(2000, 2);
+        let pixel = |api: &super::RuntimeTraceApi, x: usize, y: usize| {
+            let (key, _) = api.resource_image_region(window).unwrap();
+            let image = &api.graph_images[key];
+            let at = (y * image.width as usize + x) * 4;
+            image.rgba[at..at + 4].to_vec()
+        };
+        // Graph90:0C: window buffers drawn at full strength.
+        api.graph_config.window_buffer = (1, 0);
+        let drawn = |api: &super::RuntimeTraceApi| {
+            let mut items = Vec::new();
+            api.push_surface_draw_items(&mut items);
+            items.iter().any(|item| item.owner_object == Some(window))
+        };
+
+        // NSM_MYST's message window: Graph90:86 binds the bar as the back
+        // bitmap (copied at 0,0), Graph92:8A fills the back, Graph92:89
+        // places the bar, Graph92:88 switches the back on or off.
+        let mut bind = [window, 0, 0, 2000].map(Value::Int).to_vec();
+        call_graph(&mut api, 0x90, 0x86, &mut bind).unwrap();
+        assert!(api.graph_surfaces[&window].back_enabled);
+        assert_eq!(pixel(&api, 0, 0), bar);
+
+        let mut fill = [window, 0].map(Value::Int).to_vec();
+        call_graph(&mut api, 0x92, 0x8a, &mut fill).unwrap();
+        assert_eq!(pixel(&api, 0, 0), [0, 0, 0, 0]);
+
+        let mut place = [window, 4, 2, 2000, 128, 0].map(Value::Int).to_vec();
+        call_graph(&mut api, 0x92, 0x89, &mut place).unwrap();
+        assert_eq!(pixel(&api, 0, 0), [0, 0, 0, 0]);
+        assert_eq!(pixel(&api, 4, 2), bar);
+        assert!(drawn(&api));
+
+        let mut off = [window, 0].map(Value::Int).to_vec();
+        call_graph(&mut api, 0x92, 0x88, &mut off).unwrap();
+        assert!(!api.graph_surfaces[&window].back_enabled);
+        assert!(!drawn(&api));
+
+        let mut on = [window, 1].map(Value::Int).to_vec();
+        call_graph(&mut api, 0x92, 0x88, &mut on).unwrap();
+        assert!(drawn(&api));
     }
 
     #[test]
@@ -26442,6 +26533,10 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 } else {
                     self.retain_surface_backing(window, source_bitmap)
                 };
+                // 140068DF0 ends with 140068D60(window, source != -1).
+                if let Some(surface) = self.graph_surfaces.get_mut(&window) {
+                    surface.back_enabled = source_bitmap != -1;
+                }
                 trace_graph!(
                     self,
                     "window #{window} background bitmap=#{source_bitmap} retained={retained} diagnostic=({decoration_error_context},{frame_error_context})"
@@ -28521,16 +28616,18 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 );
             }
             (0x92, 0x88) => {
-                // sub_486BD0 -> sub_440EC0 -> sub_42B7A0: window+0x178.
+                // sub_486BD0 -> sub_440EC0 -> sub_42B7A0: window+0x178
+                // (+0x1A8 in the x64 NSM_MYST.exe, 140068D60), the switch
+                // that makes the window compose its back bitmap. Graph90:86
+                // writes the same field.
                 let value = pop_int_value(stack).unwrap_or_default();
                 let object = pop_int_value(stack).unwrap_or_default();
                 self.graph92_require_window(object)?;
-                self.graph_object_properties
-                    .entry(object)
-                    .or_default()
-                    .properties
-                    .insert(0x88, (value, 0));
-                tracing::debug!(object, value, "GraphSetTextObjectValue");
+                if let Some(surface) = self.graph_surfaces.get_mut(&object) {
+                    surface.back_enabled = value != 0;
+                }
+                tracing::debug!(object, value, "GraphSetWindowBackEnabled");
+                trace_graph!(self, "window #{object} back-enabled={}", value != 0);
             }
             (0x90, 0x0e) => {
                 // sub_47A1C0 -> sub_462340 -> sub_42F340: pops cache count,
