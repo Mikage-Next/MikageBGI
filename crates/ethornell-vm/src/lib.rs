@@ -10281,11 +10281,9 @@ impl Vm {
                 Value::Int(1)
             }
             (0x81, 0x21) => {
-                if !matches!(self.native_abi_profile, NativeAbiProfile::Amachoco | NativeAbiProfile::ModernFused) {return Ok(None);}
+                if self.native_abi_profile!=NativeAbiProfile::Amachoco {return Ok(None);}
                 // amachoco.exe's sub_4953A0 pops source then destination and
-                // converts the source from CP932 to UTF-8. NSM_MYST.exe's
-                // 1400EB8B0 is the same: two pointer pops, then 1400F6B10
-                // (MultiByteToWideChar 932 -> WideCharToMultiByte 65001). Retain the decoded
+                // converts the source from CP932 to UTF-8. Retain the decoded
                 // string as a shadow value so later BP copies and graph calls
                 // do not lose it by treating the pointer as an integer.
                 let source = self.pop_value()?;
