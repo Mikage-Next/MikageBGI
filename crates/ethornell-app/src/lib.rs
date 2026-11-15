@@ -58,6 +58,7 @@ mod host_dialog;
 mod host_installer;
 pub mod host_runtime;
 mod input_state;
+mod mp4_movie;
 mod native_background;
 mod native_background_effect;
 mod native_backml;
@@ -265,10 +266,10 @@ impl Default for NativeRuntimeProfile {
     }
 }
 
-fn confirmed_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> NativeRuntimeProfile {
+fn confirmed_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> Result<NativeRuntimeProfile> {
     let mut profile = resource_native_profile(manager, bootstrap);
-    native_profile::apply(manager, &mut profile);
-    profile
+    native_profile::apply(manager, &mut profile)?;
+    Ok(profile)
 }
 
 fn resource_native_profile(manager: &ResourceManager, bootstrap: &[u8]) -> NativeRuntimeProfile {
@@ -486,7 +487,7 @@ pub fn run(config: AppConfig) -> Result<()> {
         config.fail_on_stub,
         !headless,
         encoding,
-    ));
+    )?);
     let image: Option<DecodedImage> = None;
     if config.trace
         && let Some(image) = image.as_ref()
@@ -748,6 +749,7 @@ struct NativeControlInputLatch {
 }
 
 const MOVIE_READ_BUFFER_SIZE: usize = 12 * 1024 * 1024;
+const IMAGE_DECODE_BUFFER_MAX_CAPACITY: usize = 16 * 1024 * 1024;
 
 /// Storage for a compressed MPEG program stream while its decoder is built.
 /// Vita's CDRAM is separate from the 320 MiB user heap used by scene images.
@@ -757,7 +759,7 @@ enum MovieReadBuffer {
     Cdram(Option<VitaMovieReadBuffer>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum MovieBytes {
     Heap(std::sync::Arc<[u8]>),
     #[cfg(target_os = "vita")]
@@ -778,6 +780,12 @@ impl MovieBytes {
             #[cfg(target_os = "vita")]
             Self::Cdram { buffer, len } => &buffer.as_slice()[..*len],
         }
+    }
+}
+
+impl AsRef<[u8]> for MovieBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
     }
 }
 
@@ -832,6 +840,17 @@ struct VitaMovieReadBuffer {
     ptr: *mut u8,
     len: usize,
 }
+
+// SAFETY: this buffer exclusively owns a CPU-accessible kernel memory block,
+// with no thread-affine device state. Mutable access requires &mut self; once
+// published behind Arc<MovieBytes>, readers only receive immutable slices.
+// Arc retains the allocation until the last reader has finished, and Drop frees
+// it once. The kernel allocation/free operations do not require the creator thread.
+#[cfg(target_os = "vita")]
+unsafe impl Send for VitaMovieReadBuffer {}
+// SAFETY: shared references expose only immutable bytes, as described above.
+#[cfg(target_os = "vita")]
+unsafe impl Sync for VitaMovieReadBuffer {}
 
 #[cfg(target_os = "vita")]
 impl VitaMovieReadBuffer {
@@ -947,6 +966,9 @@ struct RuntimeTraceApi {
     /// Reusable storage for the next MPEG program stream.  On Vita it lives in
     /// CDRAM, preserving the constrained user heap for scene images.
     movie_read_buffer: MovieReadBuffer,
+    /// Reused for sequential archive-image reads; oversized assets are dropped
+    /// after decode so one resource cannot pin an unbounded source buffer.
+    image_decode_buffer: Vec<u8>,
     graph_images: BTreeMap<String, DecodedImage>,
     /// Native bitmap format associated with decoded resource images. Resource
     /// pixels are cached independently of concrete bitmap handles, so the
@@ -1453,6 +1475,7 @@ impl RuntimeTraceApi {
             trace_render_tree: std::env::var_os("TRACE_RENDER_TREE").is_some(),
             graph_trace: VecDeque::new(),
             movie_read_buffer: MovieReadBuffer::new(),
+            image_decode_buffer: Vec::new(),
             graph_images: BTreeMap::from([(
                 native_background::BACK_INACTIVE_FILL_KEY.to_string(),
                 DecodedImage {
@@ -2741,9 +2764,22 @@ impl RuntimeTraceApi {
         let Some(entry) = find_runtime_resource(&self.manager, archive_name, resource_name) else {
             return false;
         };
-        let Ok(bytes) = self.manager.read_by_entry_decoded(&entry) else {
+        let mut bytes = std::mem::take(&mut self.image_decode_buffer);
+        if bytes.capacity() > IMAGE_DECODE_BUFFER_MAX_CAPACITY {
+            bytes = Vec::new();
+        }
+        if self
+            .manager
+            .read_by_entry_decoded_into(&entry, &mut bytes)
+            .is_err()
+        {
+            self.image_decode_buffer = if bytes.capacity() <= IMAGE_DECODE_BUFFER_MAX_CAPACITY {
+                bytes
+            } else {
+                Vec::new()
+            };
             return false;
-        };
+        }
 
         // Target sub_469EE0 copies CBG +0x10..+0x1F into the internal image
         // header. sub_401EF0 accepts embedded-point flags 0/1 and, for flag 1,
@@ -2802,6 +2838,11 @@ impl RuntimeTraceApi {
                 );
                 return false;
             }
+        };
+        self.image_decode_buffer = if bytes.capacity() <= IMAGE_DECODE_BUFFER_MAX_CAPACITY {
+            bytes
+        } else {
+            Vec::new()
         };
         self.graph_image_formats
             .insert(key.clone(), native_bitmap_format);
@@ -5983,6 +6024,49 @@ impl RuntimeTraceApi {
         self.registered_pointer_input_scopes.unregister_one(packed);
     }
 
+    /// CProcCtrlDspObj reads virtual position/alpha getters. BackML's
+    /// overrides address the selected layer (Itsusora 410680/4106C0).
+    /// BackF likewise returns its source origin (KiraKira 410870), not the
+    /// unused CDspObj coordinates. Reading the base zero turns a 600->0
+    /// camera pan into a stationary 0->0 control (issue #144).
+    fn graph_control_origin(&self, object: i32) -> ((i32, i32), i32) {
+        if self
+            .graph_object_properties
+            .get(&object)
+            .and_then(|p| p.background)
+            .is_some_and(|b| b.class == NativeBackgroundClass::BackMl)
+        {
+            let layer = &self.graph91_multilayer_background.layers
+                [self.graph91_multilayer_background.selected_layer];
+            return ((layer.x_16_16, layer.y_16_16), layer.blend_parameter);
+        }
+        let position = self
+            .graph_object_properties
+            .get(&object)
+            .and_then(|p| p.background)
+            .and_then(|background| match background.position {
+                native_background::NativeBackgroundPosition::BackFSource { x, y } => Some((x, y)),
+                _ => None,
+            })
+            .or_else(|| self.graph_native_base_position(object))
+            .unwrap_or_else(|| {
+                let (x, y) = self.graph_object_position(object);
+                (x.round() as i32, y.round() as i32)
+            });
+        // Sprite mode 1 overrides GetAlpha with its transition value.
+        let alpha = self
+            .graph_transition_nodes
+            .get(&object)
+            .filter(|t| t.blend_selector == 1)
+            .map(|t| t.alpha_multiplier.clamp(0, 256))
+            .unwrap_or_else(|| {
+                self.graph_object_properties
+                    .get(&object)
+                    .map_or(0, |p| p.alpha_parameter())
+            });
+        (position, alpha)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn schedule_native_cdspobj_control(
         &mut self,
@@ -6016,31 +6100,8 @@ impl RuntimeTraceApi {
             ));
         }
 
-        let native_position = self
-            .graph_object_properties
-            .get(&object)
-            .map(|properties| (properties.native.position_x, properties.native.position_y))
-            .unwrap_or_else(|| {
-                let (x, y) = self.graph_object_position(object);
-                (x.round() as i32, y.round() as i32)
-            });
+        let (native_position, from_transparency) = self.graph_control_origin(object);
         let target_position = target_position.unwrap_or(native_position);
-        // CProcCtrlDspObj captures vtable +76 (GetAlpha).  CDspObjSprite
-        // overrides it: selector 1 returns the mode-1 transition value at
-        // +0x240, while the other recovered selectors return base CDspObj
-        // transparency (+0xAC).  Reading only portable base properties here
-        // caused mode-1 Sprite transitions to jump to the wrong start value.
-        let from_transparency = self
-            .graph_transition_nodes
-            .get(&object)
-            .filter(|transition| transition.blend_selector == 1)
-            .map(|transition| transition.alpha_multiplier.clamp(0, 256))
-            .unwrap_or_else(|| {
-                self.graph_object_properties
-                    .entry(object)
-                    .or_default()
-                    .alpha_parameter()
-            });
         // sub_41B740 calls selector -1 of sub_41B750, which reads the
         // WORD at CDspObj+0xBA: only the integer/high half of +0xB8 survives
         // when a control starts. The native updater then reconstructs 16.16
@@ -6132,25 +6193,7 @@ impl RuntimeTraceApi {
             )));
         }
 
-        let native_position = self
-            .graph_object_properties
-            .get(&object)
-            .map(|properties| (properties.native.position_x, properties.native.position_y))
-            .unwrap_or_else(|| {
-                let (x, y) = self.graph_object_position(object);
-                (x.round() as i32, y.round() as i32)
-            });
-        let from_transparency = self
-            .graph_transition_nodes
-            .get(&object)
-            .filter(|transition| transition.blend_selector == 1)
-            .map(|transition| transition.alpha_multiplier.clamp(0, 256))
-            .unwrap_or_else(|| {
-                self.graph_object_properties
-                    .entry(object)
-                    .or_default()
-                    .alpha_parameter()
-            });
+        let (native_position, from_transparency) = self.graph_control_origin(object);
 
         let Some(control_id) = self.layer_animations.schedule_native_special_path_control(
             object,
@@ -7356,33 +7399,6 @@ impl RuntimeTraceApi {
             dimensions.0,
             dimensions.1
         );
-        true
-    }
-
-    /// Graph92:8A: fill the window's back bitmap with one colour (ARGB, as
-    /// the 32-bit pixel is stored). Graph92:89 draws into the same bitmap.
-    fn fill_window_back(&mut self, window: i32, color: u32) -> bool {
-        let Some((width, height)) = self.graph_surfaces.get(&window).map(|surface| {
-            (
-                surface.width.max(1.0) as u32,
-                surface.height.max(1.0) as u32,
-            )
-        }) else {
-            return false;
-        };
-        let [b, g, r, a] = color.to_le_bytes();
-        let image = DecodedImage {
-            width,
-            height,
-            rgba: [r, g, b, a].repeat(width as usize * height as usize),
-        };
-        let key = format!("runtime:bitmap:{window}");
-        self.store_graph_image(key.clone(), image);
-        self.graph_resources
-            .insert(window, RuntimeGraphResource::whole(key));
-        if let Some(surface) = self.graph_surfaces.get_mut(&window) {
-            surface.resource_id = Some(window);
-        }
         true
     }
 
@@ -8922,6 +8938,10 @@ impl RuntimeTraceApi {
             {
                 continue;
             }
+            if self.graph_object_properties.get(&surface.id)
+                .and_then(|p| p.properties.get(&0x88)).is_some_and(|v| v.0 == 0) {
+                continue;
+            }
             let Some(resource_id) = surface.resource_id else {
                 continue;
             };
@@ -8958,7 +8978,7 @@ impl RuntimeTraceApi {
             // own) >> 8).
             if Self::is_window_surface_handle(surface.id) {
                 let (enabled, global) = self.graph_config.window_buffer;
-                if enabled == 0 || !surface.back_enabled {
+                if enabled == 0 {
                     continue;
                 }
                 let own = properties.map_or(0, |properties| properties.transparency_parameter());
@@ -9816,8 +9836,8 @@ impl RuntimeEngine {
         fail_on_stub: bool,
         native_dialog_presentation: bool,
         encoding: &'static encoding_rs::Encoding,
-    ) -> Self {
-        let profile = confirmed_native_profile(&manager, bytes);
+    ) -> Result<Self> {
+        let profile = confirmed_native_profile(&manager, bytes)?;
         let program = ethornell_script::parse_bp_program_profile(Some(script.to_string()), bytes,profile.abi);
         let mut vm = ethornell_vm::Vm::with_main_thread_regions(
             profile.main_code_bytes,
@@ -9828,7 +9848,7 @@ impl RuntimeEngine {
         vm.set_modern_pointer_tags(profile.modern_pointer_tags);
         vm.set_graph_text_encoding(encoding);
         vm.start(&program);
-        Self {
+        Ok(Self {
             vm,
             api: {
                 let mut api = RuntimeTraceApi::new_with_native_root(manager, native_root);
@@ -9848,7 +9868,7 @@ impl RuntimeEngine {
                 collect_diagnostics: trace || fail_on_stub,
             },
             last_report: None,
-        }
+        })
     }
 
     /// Sys80:6B status 5: sub_48D480 leaves its main loop and initializes the
@@ -9913,7 +9933,7 @@ impl RuntimeEngine {
             self.options.fail_on_stub,
             self.api.native_dialog_presentation,
             self.vm.graph_text_encoding(),
-        );
+        ).map_err(|error| tracing::warn!(%error, "bootstrap native profile rejected")).ok()?;
         if self.api.host_realtime_clock {
             engine.use_host_clock();
         }
@@ -11004,6 +11024,24 @@ mod input_tests {
         call_user(&mut api, 0xb0, 0xc1, &mut args).unwrap();
         assert!(args.is_empty());
         assert_eq!(ethornell_vm::SoundApi::user_font_families(&api), families);
+        assert_eq!(ethornell_vm::SoundApi::user_font_families_for_charset(&api, 0), families);
+    }
+
+    #[test]
+    fn native_caret_status_preserves_legacy_and_fused_contracts() {
+        let manager = ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.bp_profile = ethornell_vm::NativeAbiProfile::Modern;
+        let mut args = vec![Value::Int(1), Value::Int(20), Value::Int(30)];
+        assert_eq!(call_graph(&mut api, 0x90, 0x9a, &mut args).unwrap(), Value::None);
+        assert!(args.is_empty());
+        api.bp_profile = ethornell_vm::NativeAbiProfile::ModernFused;
+        let mut args = vec![Value::Int(4), Value::Int(40), Value::Int(50)];
+        assert_eq!(call_graph(&mut api, 0x90, 0x9a, &mut args).unwrap(), Value::Int(1));
+        assert!(args.is_empty());
+        let mut args = vec![Value::Int(-1), Value::Int(100), Value::Int(200)];
+        assert_eq!(call_graph(&mut api, 0x90, 0x9a, &mut args).unwrap(), Value::Int(1));
+        assert_eq!((api.graph_defaults.caret_mode, api.graph_defaults.caret_x, api.graph_defaults.caret_y), (0, 40, 50));
     }
 
     #[test]
@@ -13207,7 +13245,6 @@ mod input_tests {
         // places the bar, Graph92:88 switches the back on or off.
         let mut bind = [window, 0, 0, 2000].map(Value::Int).to_vec();
         call_graph(&mut api, 0x90, 0x86, &mut bind).unwrap();
-        assert!(api.graph_surfaces[&window].back_enabled);
         assert_eq!(pixel(&api, 0, 0), bar);
 
         let mut fill = [window, 0].map(Value::Int).to_vec();
@@ -13222,7 +13259,6 @@ mod input_tests {
 
         let mut off = [window, 0].map(Value::Int).to_vec();
         call_graph(&mut api, 0x92, 0x88, &mut off).unwrap();
-        assert!(!api.graph_surfaces[&window].back_enabled);
         assert!(!drawn(&api));
 
         let mut on = [window, 1].map(Value::Int).to_vec();
@@ -13258,6 +13294,52 @@ mod input_tests {
             api.graph_images["runtime:bitmap:1086"].rgba,
             pixel.repeat(4 * 2)
         );
+    }
+
+    #[test]
+    fn graph90_23_pans_backf_from_its_source_origin_to_the_top_of_a_tall_image() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        api.screen_width = 4;
+        api.screen_height = 2;
+        activate_backgrounds(&mut api);
+        api.store_runtime_bitmap(
+            128,
+            DecodedImage {
+                width: 4,
+                height: 4,
+                rgba: [10, 20, 30, 40]
+                    .into_iter()
+                    .flat_map(|red| [red, 0, 0, 0].repeat(4))
+                    .collect(),
+            },
+            1,
+        );
+        let mut configure = [0, 2, 128, 0, 0, 0x7000, -1, 0, 0]
+            .into_iter()
+            .map(Value::Int)
+            .collect();
+        call_graph(&mut api, 0x90, 0x43, &mut configure).unwrap();
+        let frame = |api: &super::RuntimeTraceApi| {
+            super::snapshot::compose_runtime_frame(api, false).rgba
+        };
+        assert_eq!(frame(&api)[0], 30, "initial viewport shows the lower half");
+        assert_eq!(api.graph_native_base_position(0), Some((0, 0)));
+
+        let mut control = [0, 0, 0, 0, 0, 1000, 1000, 0, 0, 113]
+            .into_iter()
+            .map(Value::Int)
+            .collect();
+        call_graph(&mut api, 0x90, 0x23, &mut control).unwrap();
+        let events = api.layer_animations.tick_native_object_controls(500);
+        api.apply_native_control_events(events);
+        assert_eq!(api.graph_control_origin(0).0, (0, 1));
+        assert_eq!(frame(&api)[0], 20, "midpoint actually moves the viewport");
+        let events = api.layer_animations.tick_native_object_controls(500);
+        api.apply_native_control_events(events);
+        assert_eq!(api.graph_control_origin(0).0, (0, 0));
+        assert_eq!(frame(&api)[0], 10, "endpoint reaches the upper half");
     }
 
     #[test]
@@ -16914,6 +16996,71 @@ mod input_tests {
     }
 
     #[test]
+    fn issue141_window_background_fill_and_gate_preserve_text() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let mut create = vec![Value::Int(800), Value::Int(600)];
+        let Value::Int(window) = call_graph(&mut api, 0x90, 0x80, &mut create).unwrap() else {
+            panic!("window");
+        };
+        api.draw_window_text_at_once(window, "kept");
+        let mut fill = vec![Value::Int(window), Value::Int(0x80123456_u32 as i32)];
+        call_graph(&mut api, 0x92, 0x8a, &mut fill).unwrap();
+        assert_eq!(
+            &api.graph_bitmap_image(window).unwrap().rgba[..4],
+            &[0x12, 0x34, 0x56, 0x80]
+        );
+        assert!(api.text_nodes.values().any(|n| n.text == "kept"));
+        api.graph_config.window_buffer = (1, 0);
+        let mut enabled = vec![Value::Int(window), Value::Int(1)];
+        call_graph(&mut api, 0x92, 0x88, &mut enabled).unwrap();
+        let mut items = Vec::new();
+        api.push_surface_draw_items(&mut items);
+        assert!(items.iter().any(|i| i.owner_object == Some(window)));
+        let mut disabled = vec![Value::Int(window), Value::Int(0)];
+        call_graph(&mut api, 0x92, 0x88, &mut disabled).unwrap();
+        items.clear();
+        api.push_surface_draw_items(&mut items);
+        assert!(!items.iter().any(|i| i.owner_object == Some(window)));
+        assert!(api.text_nodes.values().any(|n| n.text == "kept"));
+    }
+
+    #[test]
+    fn issue141_message_alignment_is_per_line_and_stable_during_reveal() {
+        let manager =
+            ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let mut api = super::RuntimeTraceApi::new(manager);
+        let window = 0xb0000000_u32 as i32;
+        let mut surface = super::RuntimeSurface::display(window, 800.0, 600.0);
+        surface.valid_left = 40;
+        surface.valid_right = 759;
+        api.graph_surfaces.insert(window, surface);
+        let cursor = api.surface_text_states.entry(window).or_default();
+        cursor.font_size = 24;
+        cursor.cursor_x = 40;
+        cursor.cursor_y = 246;
+        cursor.text_layout_mode = 1;
+        cursor.alignment_reserve_cell = true;
+        cursor.message_style = Some(crate::graph_defaults::MessageTextStyle::from_operands(
+            0xffffff,
+            [1, 5, 5, 0, 192],
+            24,
+        ));
+        api.start_native_message("　だるい。\n空".into(), Some(window));
+        let node_id = api.text_runtime.target_node.unwrap();
+        let mut node = api.text_nodes[&node_id].clone();
+        node.text = "　だ".into();
+        let partial = api.presentation_text_nodes(&node)[0].x;
+        node.text = "　だるい。\n空".into();
+        let lines = api.presentation_text_nodes(&node);
+        assert_eq!(partial, lines[0].x);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].x > lines[0].x);
+        assert!((lines[0].x - 328.0).abs() <= 1.0);
+    }
+
+    #[test]
     fn window_configuration_uses_cdspobj_alpha_without_surface_double_application() {
         let manager =
             ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
@@ -17364,6 +17511,74 @@ mod input_tests {
         api.start_native_message("Third line.".into(), Some(window));
         api.tick_text(10_000);
         assert_eq!(shown_message(&api), "Third line.");
+    }
+
+    #[test]
+    fn graph91_window_text_preserves_nvl_paragraphs_and_cursor() {
+        for selector in [0x91, 0x93] {
+            let manager =
+                ethornell_archive::ResourceManager::open_game(env!("CARGO_MANIFEST_DIR")).unwrap();
+            let mut api = super::RuntimeTraceApi::new(manager);
+            let window = message_window(&mut api);
+            api.surface_text_states.entry(window).or_default().font_size = 24;
+            api.graph_defaults.shadow_enabled = true;
+            api.graph_defaults.configure_shadow(5, 5, 192);
+            let home = api.surface_text_states[&window];
+            api.start_native_message("First sentence.".into(), Some(window));
+            api.tick_text(10_000);
+            // H2O scrmsg._bp:91:91(window, "\n", colour, 1, 1).
+            // The extended 91:93 has a shadow-disable operand after colour.
+            let mut args = vec![
+                Value::Int(window),
+                Value::Str("\n".into()),
+                Value::Int(0xffffff),
+            ];
+            if selector == 0x93 {
+                args.push(Value::Int(1));
+            }
+            args.extend([Value::Int(1), Value::Int(1)]);
+            call_graph(&mut api, 0x91, selector, &mut args).unwrap();
+            assert_eq!(
+                shown_message(&api),
+                "First sentence.\n",
+                "selector {selector:x}"
+            );
+            let cursor = api.surface_text_states[&window];
+            assert_eq!(cursor.cursor_x, home.cursor_x);
+            assert!(cursor.cursor_y > home.cursor_y);
+            api.start_native_message("Second sentence.".into(), Some(window));
+            api.tick_text(10_000);
+            assert_eq!(shown_message(&api), "First sentence.\nSecond sentence.");
+            // A skipped paragraph is drawn at the same window cursor too.
+            let mut args = vec![
+                Value::Int(window),
+                Value::Str(" More text.".into()),
+                Value::Int(0x112233),
+            ];
+            if selector == 0x93 {
+                args.push(Value::Int(1));
+            }
+            args.extend([Value::Int(1), Value::Int(1)]);
+            call_graph(&mut api, 0x91, selector, &mut args).unwrap();
+            assert_eq!(
+                shown_message(&api),
+                "First sentence.\nSecond sentence. More text."
+            );
+            assert_eq!(
+                api.text_nodes[&api.text_runtime.target_node.unwrap()].target_surface,
+                Some(window)
+            );
+            assert!(!api.text_nodes[&api.text_runtime.target_node.unwrap()].screen_attached);
+            let node = &api.text_nodes[&api.text_runtime.target_node.unwrap()];
+            assert_eq!(node.color, [17.0 / 255.0, 34.0 / 255.0, 51.0 / 255.0, 1.0]);
+            let super::snapshot::TextNodeShadow::Message(shadow) = api.text_node_shadow(node)
+            else {
+                panic!("window text style");
+            };
+            assert_eq!(shadow.is_none(), selector == 0x93);
+            call_graph(&mut api, 0x92, 0x8e, &mut vec![Value::Int(window)]).unwrap();
+            assert!(api.text_runtime.current_visible_text().is_empty());
+        }
     }
 
     fn draw_at_once(api: &mut super::RuntimeTraceApi, window: i32, text: &str) {
@@ -24670,9 +24885,11 @@ impl ethornell_vm::SysApi for RuntimeTraceApi {
                 return Ok(ethornell_vm::Value::Program(std::sync::Arc::new(program)));
             }
             (0x80, 0x41) => {
-                let program = stack.pop();
-                tracing::info!(program = ?program.as_ref().map(value_summary), "FreeProgram");
-                return Ok(ethornell_vm::Value::None);
+                // The VM owns the LIFO module chain and its root-release
+                // error. Never consume a phantom host-side argument here.
+                return Err(ethornell_vm::VmError::Runtime(
+                    "FreeLastProgramModule bypassed VM module dispatch".into(),
+                ));
             }
             (0x80, 0x34) => {
                 // Target sub_4888C0 pops file first and archive/root second,
@@ -26533,10 +26750,14 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 } else {
                     self.retain_surface_backing(window, source_bitmap)
                 };
-                // 140068DF0 ends with 140068D60(window, source != -1).
-                if let Some(surface) = self.graph_surfaces.get_mut(&window) {
-                    surface.back_enabled = source_bitmap != -1;
-                }
+                // 140068DF0 ends with 140068D60(window, source != -1): the
+                // same flag Graph92:88 writes (NSM_MYST binds its log window
+                // after switching it off).
+                self.graph_object_properties
+                    .entry(window)
+                    .or_default()
+                    .properties
+                    .insert(0x88, (i32::from(source_bitmap != -1), 0));
                 trace_graph!(
                     self,
                     "window #{window} background bitmap=#{source_bitmap} retained={retained} diagnostic=({decoration_error_context},{frame_error_context})"
@@ -28623,9 +28844,11 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 let value = pop_int_value(stack).unwrap_or_default();
                 let object = pop_int_value(stack).unwrap_or_default();
                 self.graph92_require_window(object)?;
-                if let Some(surface) = self.graph_surfaces.get_mut(&object) {
-                    surface.back_enabled = value != 0;
-                }
+                self.graph_object_properties
+                    .entry(object)
+                    .or_default()
+                    .properties
+                    .insert(0x88, (value, 0));
                 tracing::debug!(object, value, "GraphSetWindowBackEnabled");
                 trace_graph!(self, "window #{object} back-enabled={}", value != 0);
             }
@@ -28689,61 +28912,12 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                         [int(4), int(3), int(2), int(1), int(0)],
                     );
                 }
-                let state = self.window_text_state(Some(target));
-                if let Some(text) = text.as_deref().filter(|text| !text.is_empty()) {
-                    // sub_486500 and the message procedure both enter
-                    // sub_42B710, so direct formatted draws must preserve the
-                    // same ruby spans and kinsoku wrapping as 92:90.
-                    if self.graph_surfaces.contains_key(&target)
-                        && self.message_text_node_is_free_for(target)
-                    {
-                        // Into the window's text bitmap, at its cursor, as
-                        // a message draws. It is laid out on the window's
-                        // page: from a cursor in mid-line it goes on to the
-                        // window's right edge and wraps to its left edge.
-                        let drawn = self.draw_window_text_at_once(target, text);
-                        self.surface_text_buffers
-                            .entry(target)
-                            .or_default()
-                            .push_str(&drawn);
-                    } else {
-                        let parsed = text::parse_and_wrap_styled_message(text, &state);
-                        self.surface_text_buffers
-                            .entry(target)
-                            .or_default()
-                            .push_str(&parsed.text);
-                        let x = state.x;
-                        let y = state.y;
-                        // The window composes this text into its own
-                        // surface, so it is drawn at the window's priority,
-                        // as a 92:90 message is. The handle is not a
-                        // priority: 0xB0000000 put the text under the whole
-                        // scene.
-                        let z = self
-                            .graph_surfaces
-                            .get(&target)
-                            .map(|surface| surface.z)
-                            .unwrap_or(target);
-                        self.store_bitmap_text_run(
-                            target,
-                            RuntimeTextNode {
-                                text: parsed.text.clone(),
-                                enabled: true,
-                                owner_object: Some(target),
-                                screen_attached: false,
-                                target_surface: Some(target),
-                                x,
-                                y,
-                                size: state.font_size,
-                                line_height: state.line_height,
-                                formatted_layout: true,
-                                color: state.color,
-                                z,
-                                ruby_spans: parsed.ruby_spans,
-                                style_spans: parsed.style_spans,
-                            },
-                        );
-                    }
+                // 444EA0 -> 416C30: final formatter flag reserves one
+                // font cell for centred text, including immediate skip draws.
+                self.surface_text_states.entry(target).or_default().alignment_reserve_cell =
+                    args.get(5).map(value_to_i32).unwrap_or_default() != 0;
+                if let Some(text) = text.as_deref() {
+                    self.draw_formatted_window_text(target, text);
                 }
                 tracing::debug!(
                     target,
@@ -28809,6 +28983,10 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                         [int(8), int(7), int(6), int(5), int(4)],
                     );
                 }
+                // Itsusora 444D60 -> 44B9A0 -> 41DAA0: the operand
+                // after the ruby controls reserves the alignment end cell.
+                self.surface_text_states.entry(target).or_default().alignment_reserve_cell =
+                    args.get(9).map(value_to_i32).unwrap_or_default() != 0;
                 if let Some(text) = text.as_ref() {
                     // sub_4863E0 always enters sub_491220 for a valid
                     // CDspObjWindow. The target has no title-departure or
@@ -29223,11 +29401,20 @@ impl ethornell_vm::GraphApi for RuntimeTraceApi {
                 let y = pop_int_value(stack).unwrap_or_default();
                 let x = pop_int_value(stack).unwrap_or_default();
                 let mode = pop_int_value(stack).unwrap_or_default();
+                if self.bp_profile == ethornell_vm::NativeAbiProfile::ModernFused {
+                    // NSM 1.686.4 sub_1400721C0 / Triple 1.687
+                    // sub_140071F90 return 0x80000008; their BP wrappers
+                    // translate it to success 1. An unsigned mode >4 resets
+                    // mode to zero while retaining the previous coordinates.
+                    if mode as u32 > 4 {
+                        self.graph_defaults.caret_mode = 0;
+                    } else {
+                        self.graph_defaults.configure_caret_position(mode, x, y);
+                    }
+                    return Ok(ethornell_vm::Value::Int(1));
+                }
                 self.graph_defaults.configure_caret_position(mode, x, y);
                 tracing::info!(mode, x, y, "GraphSetCaretPosition");
-                // NSM_MYST 1400D8190 pushes a status (0 = success); the
-                // output contract discards it for profiles without one.
-                return Ok(ethornell_vm::Value::Int(0));
             }
             (0x90, 0x9d) => {
                 let alpha = pop_int_value(stack).unwrap_or_default();

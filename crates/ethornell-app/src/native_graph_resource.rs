@@ -28,19 +28,31 @@ impl RuntimeTraceApi {
                 if let Err(error) = self.graph92_require_window(object) {
                     return Some(Err(error));
                 }
-                self.clear_bitmap_text(object);
-                // Only a window that has a back bitmap here (bound by
-                // Graph90:86 or drawn into) is filled.
-                let filled = self
-                    .graph_surfaces
-                    .get(&object)
-                    .is_some_and(|surface| surface.resource_id.is_some())
-                    && self.fill_window_back(object, value as u32);
-                tracing::debug!(object, value, filled, "GraphFillWindowBuffer");
-                self.trace_graph(format!(
-                    "window #{object} buffer fill=0x{:08X} filled={filled}",
-                    value as u32
-                ));
+                // Itsusora 4168C0 -> 405F00 fills the independent format-2
+                // background, not the text bitmap. The high byte is alpha.
+                if let Some(surface) = self.graph_surfaces.get(&object) {
+                    let (width, height) = (surface.width as u32, surface.height as u32);
+                    if width != 0 && height != 0 {
+                        let pixel = [
+                            (value >> 16) as u8, (value >> 8) as u8,
+                            value as u8, (value >> 24) as u8,
+                        ];
+                        let mut rgba = vec![0; width as usize * height as usize * 4];
+                        for p in rgba.chunks_exact_mut(4) {
+                            p.copy_from_slice(&pixel);
+                        }
+                        let key = format!("runtime:surface:{object}:backing");
+                        self.store_graph_image(key.clone(), DecodedImage { width, height, rgba });
+                        self.graph_resources.insert(object, RuntimeGraphResource::whole(key));
+                        self.graph_surfaces.get_mut(&object).unwrap().resource_id = Some(object);
+                    }
+                }
+                self.graph_object_properties
+                    .entry(object)
+                    .or_default()
+                    .properties
+                    .insert(0x8a, (value, 0));
+                tracing::debug!(object, value, "GraphSetTextObjectAuxiliaryValue");
                 ethornell_vm::Value::None
             }
             // sub_487150 -> sub_433210: a glyph image for a character code

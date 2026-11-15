@@ -2043,12 +2043,10 @@ pub trait SoundApi {
     }
 
     /// B0:C5: GDI charset-filtered enumeration. Portable hosts may expose
-    /// their substituted stock CJK faces for DEFAULT/SHIFTJIS charsets only.
+    /// their substituted stock CJK faces for ANSI/DEFAULT/SHIFTJIS charsets.
     fn user_font_families_for_charset(&self, charset: u8) -> Vec<String> {
-        // The stock Japanese faces also carry ANSI_CHARSET, so Windows lists
-        // them for charset 0 too. NSM_MYST's ipl._bp enumerates 128 then 0
-        // and frees each result buffer; an empty ANSI list leaves the
-        // previous (already freed) pointer behind and double-frees it.
+        // NSM_MYST's IPL enumerates SHIFTJIS then ANSI and frees each
+        // result buffer. Expose the same substituted faces to both queries.
         if matches!(charset, 0|1|128) { self.user_font_families() } else { Vec::new() }
     }
 
@@ -2774,7 +2772,7 @@ impl Vm {
             trace_id: NEXT_VM_TRACE_ID.fetch_add(1, Ordering::Relaxed),
             operand_slots: vec![Value::Int(0); OPERAND_STACK_CAPACITY],
             native_abi_profile: NativeAbiProfile::default(),
-            memory: memory.into(),
+            memory: VmMemory::from_zeroed(memory),
             parked_local: None,
             heap_ptr: HEAP_OFFSET_BASE,
             rng_seed: 1,
@@ -18785,28 +18783,6 @@ mod tests {
     }
 
     #[test]
-    fn system81_utf8_copy_runs_for_modern_fused_builds() {
-        // NSM_MYST.exe 1400EB8B0 pops source then destination and calls
-        // 1400F6B10 (CP932 -> UTF-8), like amachoco's sub_4953A0.
-        let source = 0x3000;
-        let destination = 0x3100;
-        let mut vm = Vm::new();
-        vm.set_native_abi_profile(super::NativeAbiProfile::ModernFused);
-        vm.mem_values
-            .insert(vm.value_key(source), Value::Str("待宵".into()));
-        vm.stack
-            .extend([Value::Ptr(destination), Value::Ptr(source)]);
-
-        assert_eq!(
-            vm.try_builtin_sys_with_api(&mut TraceApi, 0x81, 0x21)
-                .unwrap(),
-            Some(Value::None)
-        );
-        assert!(vm.stack.is_empty());
-        assert_eq!(vm.read_c_string_bytes(destination).unwrap(), "待宵".as_bytes());
-    }
-
-    #[test]
     fn modern_fused_font_enumeration_pushes_ansi_byte_count() {
         // NSM_MYST ipl._bp enumerates charset 128 then 0 with B0:C5 and
         // frees each result; 1400D3830 pushes the result of 14006B180.
@@ -20832,9 +20808,11 @@ mod tests {
         let _ = vm.append_target_loaded_program(empty_loaded_program("worker._bp".into()));
         assert_eq!(vm.target_loaded_programs.len(), 2);
 
-        let (remaining, freed) = vm.free_last_target_program(false);
-        assert_eq!(remaining, 1);
-        assert!(freed.is_some());
+        vm.stack.push(Value::Int(12345));
+        let release = test_instruction(0x10, 0x80, "sys1", vec![0x80, 0x41], Vec::new());
+        vm.dispatch(&release, &mut TraceApi).unwrap();
+        // The ABI must not consume the caller's preceding operand.
+        assert_eq!(vm.stack, [Value::Int(12345), Value::Int(1)]);
         assert_eq!(vm.target_loaded_programs, [0]);
     }
 

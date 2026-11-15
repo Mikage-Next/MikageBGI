@@ -388,10 +388,6 @@ pub(crate) struct RuntimeSurface {
     /// CDspObjWindow+880, set through Graph91:8A. Value 1 selects the target
     /// CProcDspMsgExVE subclass for Graph92:90; value 0 selects CProcDspMsgEx.
     pub(crate) message_variant: i32,
-    /// CDspObjWindow+0x178 (+0x1A8 in the x64 NSM_MYST.exe). The window
-    /// composes its back bitmap only while set; otherwise that pass clears.
-    /// Graph90:86 sets it to `source != -1`, Graph92:88 writes it directly.
-    pub(crate) back_enabled: bool,
     pub(crate) enabled: bool,
     pub(crate) opacity: f32,
     pub(crate) z: i32,
@@ -423,7 +419,6 @@ impl RuntimeSurface {
             isolated_group: false,
             line_spacing_percent: 0,
             message_variant: 0,
-            back_enabled: true,
             enabled: true,
             opacity: 1.0,
             z: NATIVE_DISPLAY_Z,

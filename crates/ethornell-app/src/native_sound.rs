@@ -38,7 +38,9 @@ impl RuntimeTraceApi {
         // are sized together from the verified session profile.
         let channel_limit = match id {
             0x08 | 0x14 | 0x16 | 0x17 | 0x18 | 0x19 | 0x1C => Some(16),
-            0x09 | 0x22 | 0x24 | 0x25 | 0x26 | 0x2C | 0x2F => Some(self.sound_primary_volumes.len()),
+            0x09 | 0x22 | 0x24 | 0x25 | 0x26 | 0x2C | 0x2F => {
+                Some(self.sound_primary_volumes.len())
+            }
             _ => None,
         };
         if let Some(limit) = channel_limit {
@@ -293,6 +295,20 @@ impl RuntimeTraceApi {
                         0,
                     ));
                 }
+                if self.is_music_room_bgm_channel(channel) {
+                    for room_channel in self.music_room_bgm_channels() {
+                        if room_channel == channel {
+                            continue;
+                        }
+                        let index = room_channel as usize;
+                        self.bgm_fade_ramps[index] = Some(NativeSoundRamp::new(
+                            self.native_sound_tick,
+                            duration,
+                            self.bgm_fade_volumes[index],
+                            0,
+                        ));
+                    }
+                }
                 ethornell_vm::Value::None
             }
             // sub_4A2BB0 changes the independent secondary BGM gain bank.
@@ -310,8 +326,9 @@ impl RuntimeTraceApi {
                 let archive = pop_string_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
                 // sub_4984C0, then CProcLoadSound's BW and mono checks.
-                if let Err(error) = target_checks::se_channel(channel, self.sound_primary_volumes.len())
-                    .and_then(|()| self.native_se_asset_check(&archive, &file))
+                if let Err(error) =
+                    target_checks::se_channel(channel, self.sound_primary_volumes.len())
+                        .and_then(|()| self.native_se_asset_check(&archive, &file))
                 {
                     return Some(Err(error));
                 }
@@ -330,8 +347,9 @@ impl RuntimeTraceApi {
                 let archive = pop_string_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
                 // sub_4984C0, then CProcLoadSound's BW and mono checks.
-                if let Err(error) = target_checks::se_channel(channel, self.sound_primary_volumes.len())
-                    .and_then(|()| self.native_se_asset_check(&archive, &file))
+                if let Err(error) =
+                    target_checks::se_channel(channel, self.sound_primary_volumes.len())
+                        .and_then(|()| self.native_se_asset_check(&archive, &file))
                 {
                     return Some(Err(error));
                 }
@@ -372,8 +390,9 @@ impl RuntimeTraceApi {
                 let archive = pop_string_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
                 // sub_4984C0, then CProcLoadSound's BW and mono checks.
-                if let Err(error) = target_checks::se_channel(channel, self.sound_primary_volumes.len())
-                    .and_then(|()| self.native_se_asset_check(&archive, &file))
+                if let Err(error) =
+                    target_checks::se_channel(channel, self.sound_primary_volumes.len())
+                        .and_then(|()| self.native_se_asset_check(&archive, &file))
                 {
                     return Some(Err(error));
                 }
@@ -439,8 +458,9 @@ impl RuntimeTraceApi {
                 let archive = pop_string_value(stack).unwrap_or_default();
                 let channel = pop_int_value(stack).unwrap_or_default();
                 // sub_4984C0, then CProcLoadSound's BW and mono checks.
-                if let Err(error) = target_checks::se_channel(channel, self.sound_primary_volumes.len())
-                    .and_then(|()| self.native_se_asset_check(&archive, &file))
+                if let Err(error) =
+                    target_checks::se_channel(channel, self.sound_primary_volumes.len())
+                        .and_then(|()| self.native_se_asset_check(&archive, &file))
                 {
                     return Some(Err(error));
                 }
@@ -466,7 +486,9 @@ impl RuntimeTraceApi {
                 let descriptor = pop_int_value(stack).unwrap_or_default();
                 let source = stack.pop();
                 let channel = pop_int_value(stack).unwrap_or_default();
-                if let Err(error) = target_checks::se_channel(channel, self.sound_primary_volumes.len()) {
+                if let Err(error) =
+                    target_checks::se_channel(channel, self.sound_primary_volumes.len())
+                {
                     return Some(Err(error));
                 }
                 let valid = source.is_some();
@@ -691,6 +713,9 @@ impl RuntimeTraceApi {
             .and_then(|name| name.to_str())
             .unwrap_or(archive)
             .to_string();
+        if self.is_music_room_bgm_channel(channel) {
+            self.stop_music_room_other_channels(channel);
+        }
         self.bgm_slots.insert(
             channel,
             SoundSlot {
@@ -715,6 +740,36 @@ impl RuntimeTraceApi {
         set_bgm_channel_active(&mut self.bgm_channel_active, channel, false);
         self.set_native_bgm_fade_volume(channel, 128);
         true
+    }
+
+    fn is_music_room_bgm_channel(&self, channel: i32) -> bool {
+        (0..=1).contains(&channel) && self.title_child_program.as_deref() == Some("omake._bp")
+    }
+
+    fn music_room_bgm_channels(&self) -> Vec<i32> {
+        self.bgm_slots
+            .keys()
+            .copied()
+            .filter(|channel| (0..=1).contains(channel))
+            .collect()
+    }
+
+    fn stop_music_room_other_channels(&mut self, selected_channel: i32) {
+        for channel in self
+            .music_room_bgm_channels()
+            .into_iter()
+            .filter(|channel| *channel != selected_channel)
+        {
+            self.audio_requests.push_back(AudioCommand::Stop {
+                channel,
+                fade_ms: 0,
+            });
+            set_bgm_channel_active(&mut self.bgm_channel_active, channel, false);
+            self.set_bgm_clock_paused(channel, true);
+            if let Some(slot) = self.bgm_slots.get_mut(&channel) {
+                slot.needs_restart = false;
+            }
+        }
     }
 
     fn load_native_bgm_pair(
@@ -742,6 +797,9 @@ impl RuntimeTraceApi {
             };
             Some(asset)
         };
+        if self.is_music_room_bgm_channel(channel) {
+            self.stop_music_room_other_channels(channel);
+        }
         self.bgm_slots.insert(
             channel,
             SoundSlot {
@@ -1019,7 +1077,9 @@ impl RuntimeTraceApi {
         decode_gain: f64,
         playback_rate: f64,
     ) -> bool {
-        if target_checks::se_channel(channel, self.sound_primary_volumes.len()).is_err() || block.len() < 64 {
+        if target_checks::se_channel(channel, self.sound_primary_volumes.len()).is_err()
+            || block.len() < 64
+        {
             return false;
         }
         self.sound_slots.insert(
@@ -1494,6 +1554,67 @@ mod tests {
             assert!(call.args().is_empty());
         }
         result
+    }
+
+    #[test]
+    fn music_room_bgm_scope_is_limited_to_omake_channels_zero_and_one() {
+        let mut api = api_with_resident_channel();
+        api.title_child_program = Some("omake._bp".into());
+        assert!(api.is_music_room_bgm_channel(0));
+        assert!(api.is_music_room_bgm_channel(1));
+        assert!(!api.is_music_room_bgm_channel(2));
+        api.title_child_program = Some("syswnd._bp".into());
+        assert!(!api.is_music_room_bgm_channel(0));
+    }
+
+    fn named_bgm_slot(api: &RuntimeTraceApi, file: &str) -> super::super::SoundSlot {
+        let mut slot = api.sound_slots[&3].clone();
+        slot.asset.file = file.to_string();
+        slot
+    }
+
+    #[test]
+    fn music_room_replacement_stops_only_the_other_playlist_slot() {
+        let mut api = api_with_resident_channel();
+        api.title_child_program = Some("omake._bp".into());
+        let channel_zero = named_bgm_slot(&api, "music01");
+        let channel_one = named_bgm_slot(&api, "music02");
+        let unrelated = named_bgm_slot(&api, "bgm02");
+        api.bgm_slots.insert(0, channel_zero);
+        api.bgm_slots.insert(1, channel_one);
+        api.bgm_slots.insert(2, unrelated);
+        api.audio_requests.clear();
+
+        api.stop_music_room_other_channels(1);
+
+        assert_eq!(api.audio_requests.len(), 1);
+        assert!(matches!(
+            api.audio_requests.front(),
+            Some(AudioCommand::Stop {
+                channel: 0,
+                fade_ms: 0
+            })
+        ));
+        assert!(!api.bgm_slots[&0].needs_restart);
+        assert!(api.bgm_slots.contains_key(&2));
+    }
+
+    #[test]
+    fn music_room_fade_covers_its_companion_not_unrelated_channels() {
+        let mut api = api_with_resident_channel();
+        api.title_child_program = Some("omake._bp".into());
+        let channel_zero = named_bgm_slot(&api, "music01");
+        let channel_one = named_bgm_slot(&api, "music02");
+        let unrelated = named_bgm_slot(&api, "bgm02");
+        api.bgm_slots.insert(0, channel_zero);
+        api.bgm_slots.insert(1, channel_one);
+        api.bgm_slots.insert(2, unrelated);
+
+        sound_call(&mut api, 0x19, &[0, 500]).unwrap();
+
+        assert!(api.bgm_fade_ramps[0].is_some());
+        assert!(api.bgm_fade_ramps[1].is_some());
+        assert!(api.bgm_fade_ramps[2].is_none());
     }
 
     #[test]
