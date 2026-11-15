@@ -906,15 +906,11 @@ pub fn parse_bp_program(script_name: Option<String>, buf: &[u8]) -> BpProgram {
 pub fn parse_bp_program_profile(script_name: Option<String>, buf: &[u8], profile:native_abi::NativeAbiProfile) -> BpProgram {
     let range = detect_code_range(buf);
     let module_size = declared_module_size(buf);
-    // The engine loads the whole module (sub_465AB0): string literals sit
-    // after the last instruction and are read through code pointers, so they
-    // must be installed with it. Only the instructions stop at the code end.
-    let module_end = if module_size != 0 {
-        range.start + module_size as usize
-    } else {
-        range.end
-    };
-    let code = Arc::new(buf[range.start..module_end].to_vec());
+    // The disassembly boundary excludes the literal pool after the last ret.
+    // CThread copies the full declared image, including that pool: raw guest
+    // pointers (e.g. yesnownd's native confirmation text) still address it.
+    let image_end = declared_code_range(buf).map_or(range.end, |image| image.end);
+    let code = Arc::new(buf[range.start..image_end].to_vec());
     // Upstream decodes BGI 1.687's fused operations under the ModernFused
     // profile; our 1.678 operand decoding stays for every other profile.
     let dialect = if profile != native_abi::NativeAbiProfile::ModernFused
@@ -925,7 +921,7 @@ pub fn parse_bp_program_profile(script_name: Option<String>, buf: &[u8], profile
     } else {
         BpDialect::Legacy
     };
-    let mut cursor = Cursor::new(code.as_slice());
+    let mut cursor = Cursor::new(&code[..range.end - range.start]);
     let mut instructions = Vec::new();
     let mut labels = HashMap::new();
     let mut strings = Vec::new();
@@ -1835,8 +1831,6 @@ mod tests {
         assert_eq!(program.module_size, 5);
         assert_eq!(program.instructions.len(), 1);
         assert_eq!(program.instructions[0].offset, 16);
-        // Mikage: `code` holds the whole declared module (its string table
-        // follows the last ret), but nothing of the trailer.
         assert_eq!(&*program.code, &[0x17, 0, 0, 0, 0]);
 
         bytes[4..8].copy_from_slice(&100_u32.to_le_bytes());
