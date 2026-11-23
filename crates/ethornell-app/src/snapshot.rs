@@ -12,10 +12,23 @@ thread_local! {
     static SESSION_FONT: std::cell::RefCell<Option<FontArc>> = const { std::cell::RefCell::new(None) };
     static MISSING_GLYPHS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static RASTER_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    // The first few characters the session font could not draw, for the
+    // host's log. Cleared together with MISSING_GLYPHS.
+    static MISSING_CHARS: std::cell::RefCell<Vec<char>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+const MAX_MISSING_CHARS: usize = 16;
+
 pub(crate) fn take_missing_glyphs() -> bool {
+    MISSING_CHARS.with(|chars| chars.borrow_mut().clear());
     MISSING_GLYPHS.with(|m| m.replace(false))
+}
+
+/// Like `take_missing_glyphs`, also returning which characters were missing
+/// (at most a handful, each once).
+pub(crate) fn take_missing_glyph_chars() -> Option<Vec<char>> {
+    let chars = MISSING_CHARS.with(|chars| std::mem::take(&mut *chars.borrow_mut()));
+    MISSING_GLYPHS.with(|m| m.replace(false)).then_some(chars)
 }
 
 pub(crate) fn take_raster_error() -> Option<String> {
@@ -40,11 +53,17 @@ fn check_session_coverage(text: &str) {
 }
 
 fn check_font_coverage(font: &FontArc, text: impl IntoIterator<Item = char>) {
-    if text
-        .into_iter()
-        .any(|ch| !ch.is_control() && font.glyph_id(ch).0 == 0)
-    {
+    for ch in text {
+        if ch.is_control() || font.glyph_id(ch).0 != 0 {
+            continue;
+        }
         MISSING_GLYPHS.with(|missing| missing.set(true));
+        MISSING_CHARS.with(|chars| {
+            let mut chars = chars.borrow_mut();
+            if chars.len() < MAX_MISSING_CHARS && !chars.contains(&ch) {
+                chars.push(ch);
+            }
+        });
     }
 }
 
@@ -2205,6 +2224,20 @@ mod font_session_tests {
         with_font(&font, || {
             assert!(!take_missing_glyphs());
             assert!(take_raster_error().is_none());
+        });
+    }
+
+    #[test]
+    fn missing_glyph_chars_are_reported_once_and_cleared() {
+        let font = ethornell_render::FontProvider::load_system_cjk_font().expect("system CJK font");
+        with_font(&font, || {
+            assert_eq!(take_missing_glyph_chars(), None);
+            check_session_coverage("A\u{10ffff}\u{10ffff}\u{10fffe}\n");
+            assert_eq!(take_missing_glyph_chars(), Some(vec!['\u{10ffff}', '\u{10fffe}']));
+            assert_eq!(take_missing_glyph_chars(), None);
+            check_session_coverage("\u{10ffff}");
+            assert!(take_missing_glyphs());
+            assert_eq!(take_missing_glyph_chars(), None);
         });
     }
 

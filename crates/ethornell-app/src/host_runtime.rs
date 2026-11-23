@@ -207,6 +207,17 @@ pub struct HostRuntime {
     closed: bool,
     audio_suspended: bool,
     vm_budget: ethornell_vm::VmResourceBudget,
+    /// Characters already reported as missing from the text font.
+    logged_missing_glyphs: std::collections::BTreeSet<char>,
+}
+/// `U+2665 U+E000` list for logs: code points only, so no script text leaks
+/// beyond the single characters.
+fn describe_chars(chars: &[char]) -> String {
+    chars
+        .iter()
+        .map(|ch| format!("U+{:04X}", u32::from(*ch)))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 impl HostRuntime {
     pub fn create(config: HostConfig) -> Result<Self> {
@@ -327,8 +338,10 @@ impl HostRuntime {
                 if let Some(error) = snapshot::take_raster_error() {
                     return Err(EthornellError::Other(error));
                 }
-                if snapshot::take_missing_glyphs() {
-                    return Err(EthornellError::Other("font lacks bootstrap glyphs".into()));
+                if let Some(chars) = snapshot::take_missing_glyph_chars() {
+                    // Windows draws these through GDI font linking; we have one
+                    // face (plus an optional fallback), so log and go on.
+                    tracing::warn!(chars = %describe_chars(&chars), "text font lacks bootstrap glyphs; drawing them blank");
                 }
                 Ok(runtime)
             })
@@ -382,6 +395,7 @@ impl HostRuntime {
             closed: false,
             audio_suspended: false,
             vm_budget: host_vm_budget(host_physical_memory()),
+            logged_missing_glyphs: Default::default(),
         })
     }
     pub fn scope<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
@@ -829,10 +843,16 @@ impl HostRuntime {
         if let Some(error) = snapshot::take_raster_error() {
             return Err(EthornellError::Other(error));
         }
-        if snapshot::take_missing_glyphs() {
-            return Err(EthornellError::Other(
-                "font lacks required CPU bitmap/text glyphs".into(),
-            ));
+        if let Some(chars) = snapshot::take_missing_glyph_chars() {
+            // A character the face lacks (a symbol, a private-use glyph) must
+            // not end the game: log each one once and draw it blank.
+            let new: Vec<char> = chars
+                .into_iter()
+                .filter(|ch| self.logged_missing_glyphs.insert(*ch))
+                .collect();
+            if !new.is_empty() && self.logged_missing_glyphs.len() <= 256 {
+                tracing::warn!(chars = %describe_chars(&new), "text font lacks glyphs; drawing them blank");
+            }
         }
         if let Some(message) = self.runtime.api.host.fatal.take() {
             return Err(EthornellError::Other(message));
